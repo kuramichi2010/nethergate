@@ -1,5 +1,7 @@
 # nethergate
 
+**作者 / Author: Michitaka Kurahashi** · ライセンス: [MIT](LICENSE)
+
 Claude Code や Codex のような AI エージェントに、**サーバーの防御だけを安全に任せる**ための「門」です。
 AIにはシェルも生ログも渡しません。決められた狭い道具（MCPツール）だけを渡し、
 AIがどう判断しても、ポリシーを超える操作は物理的にできない構造にしています。
@@ -166,3 +168,9 @@ go test ./...                                    # パーサ、スコアリン�
 go run ./cmd/nethergate -config cfg.json scan    # 現在のインシデントをJSONで表示
 go run ./cmd/nethergate -config cfg.json verify  # 監査ログの改ざんチェック
 ```
+
+## 作者・ライセンス
+
+- 作者：**Michitaka Kurahashi**
+- ライセンス：[MIT License](LICENSE) © 2026 Michitaka Kurahashi
+  - 自由に利用・改変・再配布できますが、著作権表示（作者名）とライセンス文は残してください
