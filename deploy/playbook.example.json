@@ -1,0 +1,14 @@
+[
+  {
+    "id": "example01",
+    "name": "GraphQL introspection before targeted queries",
+    "description": "Dumps the whole GraphQL schema (__schema) to find hidden mutations; was followed by attempts on admin mutations.",
+    "handling": "Blocked the source for 6h. Introspection is disabled in production since 2026-10; no data was exposed.",
+    "match": { "path_regex": "__schema|__type\\(", "min_hits": 1 },
+    "score": 40,
+    "auto_block": true,
+    "ttl": "6h",
+    "created_by": "human",
+    "created_at": "2026-10-14T00:00:00Z"
+  }
+]

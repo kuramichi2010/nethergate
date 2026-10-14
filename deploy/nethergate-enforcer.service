@@ -1,0 +1,45 @@
+[Unit]
+Description=nethergate enforcer (nftables blocklist, privileged)
+After=nftables.service network.target
+
+[Service]
+User=ng-enforcer
+Group=nethergate
+ExecStart=/usr/local/bin/nethergate -config /etc/nethergate/config.json enforcer
+RuntimeDirectory=nethergate
+RuntimeDirectoryMode=0750
+# Own directory (= enforcer_state_dir): sharing StateDirectory=nethergate with
+# the watch service would make systemd chown it, and the enforcer's audit log
+# inside it, to ng-agent whenever the watch service starts.
+StateDirectory=nethergate-enforcer
+StateDirectoryMode=0750
+UMask=0027
+Restart=on-failure
+
+# Only the capability needed to edit the nftables set.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

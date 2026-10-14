@@ -1,0 +1,22 @@
+{
+  "_comment": "Paste one into config.json \"triage\".\"command\". Runs on the host where the AI CLI is logged in. claude: --tools \"\" removes every built-in tool (Read/Grep/WebSearch too, which --disallowedTools alone left available), so only the nethergate MCP tools remain.",
+  "claude": [
+    "claude",
+    "-p",
+    "--mcp-config",
+    "/etc/nethergate/claude-mcp.local.json",
+    "--strict-mcp-config",
+    "--tools",
+    "",
+    "--allowedTools",
+    "mcp__nethergate"
+  ],
+  "_comment_codex": "codex: --sandbox read-only still lets the model run read-only shell commands (it can read whatever ng-agent can read, e.g. the logs). Prefer claude, or accept that exposure.",
+  "codex": [
+    "codex",
+    "exec",
+    "--sandbox",
+    "read-only",
+    "-"
+  ]
+}

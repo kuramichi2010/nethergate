@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nethergate": {
+      "command": "/usr/local/bin/nethergate",
+      "args": ["-config", "/etc/nethergate/config.json", "mcp"]
+    }
+  }
+}

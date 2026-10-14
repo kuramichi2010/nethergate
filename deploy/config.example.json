@@ -1,0 +1,35 @@
+{
+  "logs": [
+    { "path": "/var/log/nginx/access.log", "format": "nginx" },
+    { "path": "/var/log/auth.log", "format": "sshd" }
+  ],
+  "state_dir": "/var/lib/nethergate",
+  "enforcer_state_dir": "/var/lib/nethergate-enforcer",
+  "report_dir": "/var/lib/nethergate/reports",
+  "enforcer_socket": "/run/nethergate/enforcer.sock",
+  "enforcer_client_uids": [],
+  "allowlist": ["127.0.0.0/8", "::1/128", "192.0.2.10/32"],
+  "window": "24h",
+  "max_scan_bytes": 67108864,
+  "policy": {
+    "dry_run": true,
+    "default_ttl": "1h",
+    "max_ttl": "24h",
+    "max_blocks_per_hour": 60,
+    "auto_block_score": 90,
+    "ai_min_score": 30
+  },
+  "osint": { "enabled": true, "abuseipdb_key_env": "ABUSEIPDB_KEY" },
+  "triage": {
+    "command": [],
+    "min_score": 60,
+    "cooldown": "15m",
+    "timeout": "5m"
+  },
+  "notify": { "webhook_url": "" },
+  "playbook": {
+    "path": "/etc/nethergate/playbook.json",
+    "lessons_path": "/etc/nethergate/lessons.json",
+    "max_match_ips": 200
+  }
+}
