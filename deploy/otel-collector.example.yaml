@@ -1,0 +1,18 @@
+# OpenTelemetry Collector: scrape nethergate's Prometheus endpoint and
+# export OTLP to your backend.
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: nethergate
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["127.0.0.1:9464"]
+exporters:
+  otlphttp:
+    endpoint: https://otel.example.com
+service:
+  pipelines:
+    metrics:
+      receivers: [prometheus]
+      exporters: [otlphttp]

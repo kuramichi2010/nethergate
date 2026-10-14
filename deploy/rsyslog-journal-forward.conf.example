@@ -1,0 +1,14 @@
+# /etc/rsyslog.d/60-nethergate-forward.conf
+# Ship the nethergate units' journal (including NETHERGATE-ANCHOR lines) to a
+# remote syslog server over TLS. This complements forward.syslog in
+# config.json, which ships the audit records themselves.
+module(load="imjournal")
+global(DefaultNetstreamDriverCAFile="/etc/ssl/certs/siem-ca.pem")
+
+if ($!_SYSTEMD_UNIT startswith "nethergate-") then {
+  action(type="omfwd" target="siem.example.com" port="6514" protocol="tcp"
+         StreamDriver="gtls" StreamDriverMode="1" StreamDriverAuthMode="x509/name"
+         StreamDriverPermittedPeers="siem.example.com"
+         queue.type="LinkedList" queue.filename="nethergate_fwd" queue.saveOnShutdown="on"
+         action.resumeRetryCount="-1")
+}

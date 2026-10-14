@@ -32,6 +32,26 @@ type Engine struct {
 	extra []netip.Prefix
 }
 
+// Remaining returns how many more blocks actor may place in the current
+// hour (the smaller of its quota and the global cap).
+func (e *Engine) Remaining(actor string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cut := e.now().Add(-time.Hour)
+	used, all := 0, 0
+	for _, t := range e.byActr[actor] {
+		if t.After(cut) {
+			used++
+		}
+	}
+	for _, t := range e.recent {
+		if t.After(cut) {
+			all++
+		}
+	}
+	return max(0, min(e.cfg.QuotaPerHour[actor]-used, e.cfg.MaxBlocksPerHour-all))
+}
+
 // SetExtraAllow replaces the human-approved allow prefixes from the playbook.
 func (e *Engine) SetExtraAllow(p []netip.Prefix) {
 	e.mu.Lock()

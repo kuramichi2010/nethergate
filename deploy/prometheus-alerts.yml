@@ -1,0 +1,54 @@
+# Prometheus alerting rules for nethergate (scrape http://127.0.0.1:9464/metrics).
+groups:
+  - name: nethergate
+    rules:
+      - alert: NethergateAuditWriteFailure
+        expr: increase(nethergate_enforcer_audit_write_failures_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "Enforcer could not write its audit log; firewall changes are being refused (fail closed)."
+      - alert: NethergateAuditTampering
+        expr: increase(nethergate_forward_tamper_events_total[10m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "An audit file shrank, was replaced or disappeared. Treat the host as compromised."
+      - alert: NethergateEnforcerDown
+        expr: nethergate_enforcer_up == 0 or absent(nethergate_enforcer_up)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "The enforcer is not answering: no blocks can be placed or lifted."
+      - alert: NethergateAIRefusalSpike
+        expr: sum(increase(nethergate_enforcer_requests_total{actor="ai",result="rejected"}[15m])) > 10
+        labels: {severity: warning}
+        annotations:
+          summary: "The enforcer keeps refusing the AI's requests: possible prompt injection or a confused agent."
+      - alert: NethergateQuotaExhausted
+        expr: nethergate_enforcer_quota_remaining == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.actor }} has used its hourly block quota; a human may need to step in."
+      - alert: NethergateUnknownPeer
+        expr: increase(nethergate_enforcer_unknown_peer_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "A process with no role tried to use the enforcer socket."
+      - alert: NethergateForwardingStalled
+        expr: max(nethergate_forward_lag_bytes) > 0 and increase(nethergate_forward_errors_total[15m]) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Audit records are not reaching the SIEM."
+      - alert: NethergateReviewsWaiting
+        expr: nethergate_reviews_pending > 0
+        for: 1h
+        labels: {severity: info}
+        annotations:
+          summary: "The AI has been waiting over an hour for a human decision (nethergate review list)."
+      - alert: NethergateDryRun
+        expr: nethergate_enforcer_dry_run == 1
+        for: 7d
+        labels: {severity: info}
+        annotations:
+          summary: "nethergate has been in dry-run for a week: nothing is actually being blocked."

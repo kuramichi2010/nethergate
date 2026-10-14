@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +34,7 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/audit"
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/metrics"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 	"github.com/kuramichi2010/nethergate/internal/policy"
 	"github.com/kuramichi2010/nethergate/internal/sanitize"
@@ -82,6 +84,9 @@ type Response struct {
 	Error  string  `json:"error,omitempty"`
 	DryRun bool    `json:"dry_run,omitempty"`
 	Blocks []Block `json:"blocks,omitempty"`
+	// "metrics": Prometheus text, re-exported by the watch daemon (the
+	// enforcer itself has no network access).
+	Metrics string `json:"metrics,omitempty"`
 }
 
 type Server struct {
@@ -97,6 +102,7 @@ type Server struct {
 	// OnAudit is called after records are appended (e.g. to publish the
 	// chain head as an external anchor).
 	OnAudit func()
+	metrics *metrics.Registry
 	// StatePath persists active blocks so a restarted enforcer can still
 	// list and unblock them (and re-installs them after a reboot).
 	StatePath string
@@ -110,7 +116,39 @@ type Server struct {
 }
 
 func NewServer(p *policy.Engine, a *audit.Log, clients config.EnforcerClients, thresholds config.Policy, dryRun bool) *Server {
-	return &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}}
+	m := metrics.New()
+	m.Describe("nethergate_enforcer_requests_total", metrics.Counter, "Requests handled by the enforcer, by op, actor and result (ok|rejected|error).")
+	m.Describe("nethergate_enforcer_audit_write_failures_total", metrics.Counter, "Audit writes that failed; firewall changes were refused (fail closed). Should always be 0.")
+	m.Describe("nethergate_enforcer_unknown_peer_total", metrics.Counter, "Connections from UIDs without a role.")
+	m.Describe("nethergate_enforcer_active_blocks", metrics.Gauge, "Blocks currently in place, by owner.")
+	m.Describe("nethergate_enforcer_quota_remaining", metrics.Gauge, "Blocks each automated actor may still place this hour.")
+	m.Describe("nethergate_enforcer_audit_records", metrics.Gauge, "Records in the enforcer audit chain.")
+	m.Describe("nethergate_enforcer_dry_run", metrics.Gauge, "1 if the enforcer does not touch the firewall.")
+	return &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}, metrics: m}
+}
+
+// metricsText refreshes the gauges and renders all enforcer metrics.
+// Caller holds s.mu.
+func (s *Server) metricsText() string {
+	m := s.metrics
+	m.Reset("nethergate_enforcer_active_blocks")
+	for _, owner := range []string{"ai", "rules", "playbook", "human"} {
+		m.Set("nethergate_enforcer_active_blocks", 0, "owner", owner)
+	}
+	for _, b := range s.blocks {
+		m.Add("nethergate_enforcer_active_blocks", 1, "owner", b.Actor)
+	}
+	for _, a := range []string{"ai", "rules", "playbook"} {
+		m.Set("nethergate_enforcer_quota_remaining", float64(s.Policy.Remaining(a)), "actor", a)
+	}
+	n, _ := s.Audit.Head()
+	m.Set("nethergate_enforcer_audit_records", float64(n))
+	dry := 0.0
+	if s.DryRun {
+		dry = 1
+	}
+	m.Set("nethergate_enforcer_dry_run", dry)
+	return m.Text()
 }
 
 // RoleOf maps a peer UID to its role. Root is always admin.
@@ -258,6 +296,7 @@ func (s *Server) handle(c *net.UnixConn) {
 		role = s.RoleOf(uid)
 	}
 	if role == RoleNone {
+		s.metrics.Inc("nethergate_enforcer_unknown_peer_total")
 		_ = s.Audit.Write(fmt.Sprintf("uid:%d", uid), "connect", nil, "denied: uid not allowed")
 		_ = json.NewEncoder(c).Encode(Response{Error: "permission denied"})
 		return
@@ -273,6 +312,27 @@ func (s *Server) handle(c *net.UnixConn) {
 
 // Do executes one request from a caller with the given role.
 func (s *Server) Do(role Role, req Request) Response {
+	resp, actor := s.do(role, req)
+	if req.Op != "list" && req.Op != "metrics" {
+		result := "ok"
+		switch {
+		case resp.OK:
+		case strings.HasPrefix(resp.Error, "audit log unavailable"):
+			result = "error"
+			s.metrics.Inc("nethergate_enforcer_audit_write_failures_total")
+		default:
+			result = "rejected"
+		}
+		op := req.Op
+		if op != "block" && op != "unblock" {
+			op = "other"
+		}
+		s.metrics.Inc("nethergate_enforcer_requests_total", "op", op, "actor", actor, "result", result)
+	}
+	return resp
+}
+
+func (s *Server) do(role Role, req Request) (Response, string) {
 	var actor string
 	switch role {
 	case RoleAdmin:
@@ -285,10 +345,10 @@ func (s *Server) Do(role Role, req Request) Response {
 			actor = "playbook"
 		}
 	default:
-		return Response{Error: "permission denied"}
+		return Response{Error: "permission denied"}, actor
 	}
 	if req.RuleID != "" && role != RoleWatch {
-		return Response{Error: "rule_id is only accepted from the watch daemon"}
+		return Response{Error: "rule_id is only accepted from the watch daemon"}, actor
 	}
 	// Both end up in the audit log and are shown back to the AI via "list".
 	req.Reason = sanitize.Untrusted(req.Reason)
@@ -311,29 +371,35 @@ func (s *Server) Do(role Role, req Request) Response {
 		for _, b := range s.blocks {
 			out = append(out, b)
 		}
-		return Response{OK: true, DryRun: s.DryRun, Blocks: out}
+		return Response{OK: true, DryRun: s.DryRun, Blocks: out}, actor
+	}
+	if req.Op == "metrics" {
+		if role != RoleWatch && role != RoleAdmin {
+			return Response{Error: "permission denied"}, actor
+		}
+		return Response{OK: true, Metrics: s.metricsText()}, actor
 	}
 	reject := func(err error) Response {
 		_ = s.Audit.Write(actor, req.Op, req, "rejected: "+err.Error())
 		return Response{Error: err.Error()}
 	}
 	if authErr != nil {
-		return reject(authErr)
+		return reject(authErr), actor
 	}
 	if req.Op == "unblock" {
 		if role == RoleWatch {
-			return reject(errors.New("the watch daemon cannot unblock"))
+			return reject(errors.New("the watch daemon cannot unblock")), actor
 		}
 		if ip, err := policy.ParseAddr(req.IP); err == nil {
 			if b, ok := s.blocks[ip.String()]; ok && actor == "ai" && b.Actor != "ai" {
-				return reject(fmt.Errorf("block on %s was placed by %s; only a human can lift it", ip, b.Actor))
+				return reject(fmt.Errorf("block on %s was placed by %s; only a human can lift it", ip, b.Actor)), actor
 			}
 		}
 	}
 	act := policy.Action{Kind: req.Op, IP: req.IP, TTL: req.TTL, Reason: req.Reason, Actor: actor}
 	ip, ttl, err := s.Policy.Check(&act)
 	if err != nil {
-		return reject(err)
+		return reject(err), actor
 	}
 	if ruleTTL > 0 {
 		ttl = min(ttl, ruleTTL)
@@ -346,7 +412,7 @@ func (s *Server) Do(role Role, req Request) Response {
 		expires := time.Now().Add(ttl)
 		old, exists := s.blocks[key]
 		if exists && !old.Expires.Before(expires) {
-			return Response{OK: true, DryRun: s.DryRun} // already blocked at least this long
+			return Response{OK: true, DryRun: s.DryRun}, actor // already blocked at least this long
 		}
 		owner := actor
 		if exists && rank[old.Actor] > rank[actor] {
@@ -355,7 +421,7 @@ func (s *Server) Do(role Role, req Request) Response {
 		// Fail closed: no firewall change that is not in the audit log.
 		if err := s.Audit.Write(actor, "block_intent", detail, "pending"); err != nil {
 			log.Printf("audit unavailable, refusing block of %s: %v", key, err)
-			return Response{Error: "audit log unavailable; refusing to change the firewall"}
+			return Response{Error: "audit log unavailable; refusing to change the firewall"}, actor
 		}
 		if !s.DryRun {
 			if exists {
@@ -371,11 +437,11 @@ func (s *Server) Do(role Role, req Request) Response {
 		}
 	case "unblock":
 		if _, ok := s.blocks[key]; !ok {
-			return reject(errors.New("not currently blocked by nethergate"))
+			return reject(errors.New("not currently blocked by nethergate")), actor
 		}
 		if err := s.Audit.Write(actor, "unblock_intent", detail, "pending"); err != nil {
 			log.Printf("audit unavailable, refusing unblock of %s: %v", key, err)
-			return Response{Error: "audit log unavailable; refusing to change the firewall"}
+			return Response{Error: "audit log unavailable; refusing to change the firewall"}, actor
 		}
 		if !s.DryRun {
 			err = s.runNft("delete", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s }", key))
@@ -400,9 +466,9 @@ func (s *Server) Do(role Role, req Request) Response {
 		s.OnAudit()
 	}
 	if err != nil {
-		return Response{Error: err.Error()}
+		return Response{Error: err.Error()}, actor
 	}
-	return Response{OK: true, DryRun: s.DryRun}
+	return Response{OK: true, DryRun: s.DryRun}, actor
 }
 
 // authorize re-derives the incident behind an automated block. It returns

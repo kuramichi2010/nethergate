@@ -145,6 +145,33 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer 
 - 自動で調査させる場合は、`deploy/triage-command.example.json` の内容を config の `triage.command` に入れます（nethergateのツール以外は使えないようにしてあります）
   - 同じサーバー上で調査させる場合も、MCPサーバーは必ず **ng-mcp** として動かします（`deploy/claude-mcp.local.example.json`：localhost へのSSHでユーザーを切り替える）。watch のユーザーのまま `nethergate mcp` を起動しようとすると、起動を拒否します
 
+## 証拠を外に出す・状態を見る（SIEM連携とメトリクス）
+
+### SIEM / syslog への転送
+`config.json` の `forward` を設定すると、watch が**すべての監査ログ（enforcer の分を含む）を1件ずつ外部へ転送**します。サーバーが乗っ取られても、証拠は別の場所に残ります。
+
+- 送り先：**syslog**（RFC5424、TLS、ポート6514。`ca_file` で社内CAも指定できる）と **HTTP**（`ndjson`：Elastic・Loki・Vector・Fluent Bit など ／ `splunk_hec`）。トークンは `/etc/nethergate/env` に置き、`token_env` で変数名を指定する
+- **送れない間も失われない**：監査ログ自体を送信待ちの記録として使い、送信に成功したときだけ「どこまで送ったか」を進める（同じ記録が二重に届くことはあるので、受信側は `file` と `n` で重複を除く）
+- 一定量ずつまとめて送り、その都度「その時点の件数とハッシュ」（`anchor`）も送るので、SIEM 側だけで改ざんを検証できる
+- **監査ログのファイルが縮んだ、差し替えられた、消えた**ときは、その場で `tamper` イベント（syslog の重大度は alert）を送る
+- 暗号化なしの syslog は、同じサーバー上の中継（127.0.0.1）宛てにしか送れない
+- journald（`NETHERGATE-ANCHOR` 行を含む）の転送例：`deploy/rsyslog-journal-forward.conf.example`
+
+### メトリクス（Prometheus / OpenTelemetry）
+`"metrics": {"listen": "127.0.0.1:9464"}` で `/metrics` を公開します。初期設定では、このサーバー自身（ループバック）からしか読めません。enforcer は新たに待ち受けポートを開かず、数値は今あるソケット経由で watch に渡し、watch がまとめて公開します。
+
+| 主なメトリクス | 意味 |
+|---|---|
+| `nethergate_enforcer_requests_total{op,actor,result}` | enforcer の処理件数（ok / rejected / error） |
+| `nethergate_enforcer_audit_write_failures_total` | 監査ログに書けずファイアウォールの変更を中止した回数。**常に0であるべき** |
+| `nethergate_enforcer_quota_remaining{actor}` / `nethergate_enforcer_active_blocks{owner}` | 送り手ごとの件数上限の残り / 現在のブロック数 |
+| `nethergate_forward_tamper_events_total` / `nethergate_forward_lag_bytes` | 改ざんの疑いを検知した回数 / SIEM にまだ送っていない量 |
+| `nethergate_incidents{severity}` / `nethergate_reviews_pending` / `nethergate_playbook_proposals_pending` | 直近のインシデント数 / 相談待ち / 承認待ちの提案 |
+| `nethergate_triage_runs_total` / `nethergate_triage_duration_seconds` | AIによる調査の回数と所要時間 |
+
+- 警告ルールの例：`deploy/prometheus-alerts.yml`（監査ログの書き込み失敗、改ざん、enforcer の停止、AIの拒否の急増、件数上限の使い切り、承認待ちの放置、dry-run のまま1週間など）
+- OpenTelemetry：`deploy/otel-collector.example.yaml`（Collector の prometheus receiver で読み取り、OTLP で送る）
+
 ## サーバー構成のアドバイス
 
 **ネットワークの境界**
@@ -170,10 +197,23 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer 
 ## 開発
 
 ```bash
-go test ./...                                    # パーサ、スコアリング、ポリシー、監査ログ、MCPのテスト
+go test -race -short ./...                       # 単体テスト
+go test ./e2e                                    # 結合テスト：実際のバイナリを偽の nft で動かす
+./scripts/fuzz.sh 30s                            # 全ファジング対象を各30秒
 go run ./cmd/nethergate -config cfg.json scan    # 現在のインシデントをJSONで表示
 go run ./cmd/nethergate -config cfg.json verify  # 監査ログの改ざんチェック
 ```
+
+- **結合テスト**（`e2e/`）：enforcer・watch・mcp・CLI を本物のソケットでつなぎ、次を確認する
+  - ルールによる自動ブロック
+  - 乗っ取られたAIを想定した直接リクエストが、enforcer で拒否される
+  - 監査ログが書けないときはファイアウォールを変更しない
+  - 記録書の提案 → 承認 → 即ブロック
+  - ユーザーによる誤ブロックの訂正
+  - SIEM への転送とメトリクスの公開
+  - アンカーと改ざん通知による、ログ切り詰めの検出
+- **ファジング**：ログの読み取り（送信元IPが攻撃者の書いた部分に左右されないこと）、無害化、記録書・教訓・設定・監査ログ・MCP・enforcer のリクエスト。問題が見つかった入力は `testdata/fuzz/` に保存され、以後のテストで毎回確認される
+- **CI**（GitHub Actions）：push のたびに gofmt・vet・race・結合テスト・短時間のファジング。毎晩、全ファジング対象を各5分
 
 ## 作者・ライセンス
 

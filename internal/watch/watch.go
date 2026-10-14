@@ -20,7 +20,9 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/detect"
 	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/forward"
 	"github.com/kuramichi2010/nethergate/internal/logscan"
+	"github.com/kuramichi2010/nethergate/internal/metrics"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 	"github.com/kuramichi2010/nethergate/internal/sanitize"
 )
@@ -40,6 +42,9 @@ type Daemon struct {
 	// Reviews the AI queued for humans that were already announced.
 	reviewsStamp    string
 	reviewsNotified map[string]bool
+
+	metrics   *metrics.Registry
+	forwarder *forward.Forwarder
 }
 
 func fileStamp(path string) string {
@@ -69,6 +74,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 	d.analyzer = a
+	d.metrics = newMetrics()
+	if err := d.startObservability(ctx); err != nil {
+		return err
+	}
 	d.blocked = map[netip.Addr]time.Time{}
 	d.triaged = map[netip.Addr]time.Time{}
 	d.notified = map[netip.Addr]int{}
@@ -126,6 +135,7 @@ func (d *Daemon) step(ctx context.Context, now time.Time) {
 	for _, inc := range d.analyzer.Incidents(now.Add(-10*time.Minute), 25) {
 		d.handle(ctx, inc, now)
 	}
+	d.updateStepGauges(now)
 }
 
 func (d *Daemon) handle(ctx context.Context, inc *detect.Incident, now time.Time) {
@@ -248,6 +258,14 @@ func (d *Daemon) block(inc *detect.Incident, ttl time.Duration, ruleID, reason s
 	// Back off either way so a refused block is not retried every tick,
 	// but retry a failure (e.g. enforcer restarting) sooner than the TTL.
 	backoff := ttl
+	kind, result := "rules", "ok"
+	if ruleID != "" {
+		kind = "playbook"
+	}
+	if err != nil {
+		result = "refused"
+	}
+	d.inc("nethergate_auto_block_requests_total", "kind", kind, "result", result)
 	if err != nil {
 		log.Printf("auto-block %s (rule %q): %v", inc.IP, ruleID, err)
 		backoff = min(backoff, 5*time.Minute)
@@ -281,10 +299,15 @@ func (d *Daemon) runTriage(ctx context.Context, ip netip.Addr, score int) {
 	cmd.Stdin = bytes.NewBufferString(fmt.Sprintf(triagePrompt, ip, score))
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
+	started := time.Now()
 	err := cmd.Run()
+	d.observe("nethergate_triage_duration_seconds", time.Since(started).Seconds())
 	result := "ok"
 	if err != nil {
 		result = "error: " + err.Error()
+		d.inc("nethergate_triage_runs_total", "result", "error")
+	} else {
+		d.inc("nethergate_triage_runs_total", "result", "ok")
 	}
 	tail := out.String()
 	if len(tail) > 2000 {
@@ -306,6 +329,7 @@ func (d *Daemon) send(msg string) {
 	case d.notifyQ <- msg:
 	default:
 		log.Printf("webhook queue full, dropped: %s", msg)
+		d.inc("nethergate_notifications_total", "result", "dropped")
 	}
 }
 
@@ -330,6 +354,7 @@ func (d *Daemon) notifier(ctx context.Context) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.Cfg.Notify.WebhookURL, bytes.NewReader(body))
 		if err != nil {
 			log.Printf("webhook: %v", err)
+			d.inc("nethergate_notifications_total", "result", "error")
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -341,8 +366,10 @@ func (d *Daemon) notifier(ctx context.Context) {
 				err = ue.Err
 			}
 			log.Printf("webhook: %v", err)
+			d.inc("nethergate_notifications_total", "result", "error")
 			continue
 		}
 		resp.Body.Close()
+		d.inc("nethergate_notifications_total", "result", "sent")
 	}
 }

@@ -10,10 +10,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -44,7 +47,7 @@ type env struct {
 
 func (e *env) path(p string) string { return filepath.Join(e.dir, p) }
 
-func (e *env) writeConfig(name, clients string) {
+func (e *env) writeConfig(name, clients string, extra ...string) {
 	cfg := fmt.Sprintf(`{
   "logs": [{"path": "access.log", "format": "nginx"}],
   "state_dir": "st", "enforcer_state_dir": "est", "report_dir": "rep",
@@ -54,8 +57,8 @@ func (e *env) writeConfig(name, clients string) {
   "audit_anchor": {"interval": "1s"},
   "policy": {"dry_run": false, "default_ttl": "1h", "max_ttl": "24h", "max_blocks_per_hour": 60,
              "quota_per_hour": {"ai": 20, "rules": 60, "playbook": 60}, "auto_block_score": 90, "ai_min_score": 30},
-  "playbook": {"path": "playbook.json", "lessons_path": "lessons.json", "max_match_ips": 200}
-}`, clients)
+  "playbook": {"path": "playbook.json", "lessons_path": "lessons.json", "max_match_ips": 200}%s
+}`, clients, strings.Join(append([]string{""}, extra...), ",\n  "))
 	if err := os.WriteFile(e.path(name+".json"), []byte(cfg), 0o600); err != nil {
 		e.t.Fatal(err)
 	}
@@ -303,6 +306,97 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	// A plaintext syslog relay on loopback stands in for the SIEM.
+	siem, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer siem.Close()
+	received := make(chan string, 4096)
+	go func() {
+		for {
+			c, err := siem.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				r := bufio.NewReader(c)
+				for {
+					lenStr, err := r.ReadString(' ')
+					if err != nil {
+						return
+					}
+					n, _ := strconv.Atoi(strings.TrimSpace(lenStr))
+					buf := make([]byte, n)
+					if _, err := io.ReadFull(r, buf); err != nil {
+						return
+					}
+					received <- string(buf)
+				}
+			}()
+		}
+	}()
+	metricsLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	metricsAddr := metricsLn.Addr().String()
+	metricsLn.Close()
+	e.writeConfig("as-watch-obs", fmt.Sprintf(`{"watch_uids": [%d]}`, e.uid),
+		fmt.Sprintf(`"forward": {"interval": "1s", "syslog": {"address": %q, "plaintext": true}}`, siem.Addr().String()),
+		fmt.Sprintf(`"metrics": {"listen": %q}`, metricsAddr))
+	var siemLog strings.Builder
+	waitSIEM := func(what string, cond func(string) bool) {
+		e.waitFor(what, 15*time.Second, func() bool {
+			for {
+				select {
+				case m := <-received:
+					siemLog.WriteString(m + "\n")
+				default:
+					return cond(siemLog.String())
+				}
+			}
+		})
+	}
+
+	t.Run("audit records reach the SIEM and metrics are exported", func(t *testing.T) {
+		stopE := e.start("as-watch-obs", "enforcer")
+		stopW := e.start("as-watch-obs", "watch")
+		waitSIEM("enforcer audit records at the SIEM", func(s string) bool {
+			return strings.Contains(s, `"file":"enforcer-audit.jsonl"`) && strings.Contains(s, " anchor - ")
+		})
+		// Counters live in each process: produce a refusal and an audit
+		// failure in this enforcer so the metrics have something to show.
+		e.raw(`{"op":"block","ip":"` + visitor + `","reason":"no incident"}`)
+		auditFile := e.path("est/enforcer-audit.jsonl")
+		_ = os.Chmod(auditFile, 0o400)
+		e.raw(`{"op":"block","ip":"` + attacker + `","reason":"extend","ttl":72000000000000}`)
+		_ = os.Chmod(auditFile, 0o640)
+		var body string
+		e.waitFor("metrics endpoint", 10*time.Second, func() bool {
+			resp, err := http.Get("http://" + metricsAddr + "/metrics")
+			if err != nil {
+				return false
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			body = string(b)
+			return strings.Contains(body, "nethergate_enforcer_up 1")
+		})
+		for _, want := range []string{
+			`nethergate_enforcer_requests_total{actor="rules",op="block",result="ok"}`,
+			`nethergate_enforcer_requests_total{actor="rules",op="block",result="rejected"} 1`,
+			`nethergate_enforcer_requests_total{actor="rules",op="block",result="error"} 1`,
+			`nethergate_enforcer_audit_write_failures_total 1`,
+			`nethergate_enforcer_quota_remaining{actor="ai"}`,
+			`nethergate_playbook_rules{verdict="allow"} 1`,
+			`nethergate_audit_records{file="enforcer-audit.jsonl"}`,
+		} {
+			if !strings.Contains(body, want) {
+				t.Errorf("metrics missing %s", want)
+			}
+		}
+		stopW()
+		stopE()
+	})
+
 	t.Run("audit logs verify, and truncation is caught by the anchors", func(t *testing.T) {
 		if out, err := e.run("as-admin", "verify"); err != nil {
 			t.Fatalf("verify: %v\n%s", err, out)
@@ -329,5 +423,11 @@ func TestEndToEnd(t *testing.T) {
 		if err == nil || !strings.Contains(out, "TAMPERED") {
 			t.Fatalf("truncation not detected:\n%s", out)
 		}
+		// The forwarder notices too, and tells the SIEM right away.
+		stopW := e.start("as-watch-obs", "watch")
+		defer stopW()
+		waitSIEM("tamper event at the SIEM", func(s string) bool {
+			return strings.Contains(s, " tamper - ") && strings.Contains(s, "enforcer-audit.jsonl")
+		})
 	})
 }

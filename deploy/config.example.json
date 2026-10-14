@@ -29,6 +29,11 @@
     "timeout": "5m"
   },
   "notify": { "webhook_url": "" },
+  "forward": {
+    "interval": "5s",
+    "syslog": { "address": "siem.example.com:6514", "ca_file": "", "server_name": "" }
+  },
+  "metrics": { "listen": "127.0.0.1:9464" },
   "playbook": {
     "path": "/etc/nethergate/playbook.json",
     "lessons_path": "/etc/nethergate/lessons.json",

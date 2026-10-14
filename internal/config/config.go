@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -93,6 +94,35 @@ type AuditAnchor struct {
 	URL string `json:"url"`
 }
 
+// Forward ships every audit record to a remote syslog server or SIEM.
+type Forward struct {
+	Interval Duration       `json:"interval"`
+	Syslog   *ForwardSyslog `json:"syslog,omitempty"`
+	HTTP     *ForwardHTTP   `json:"http,omitempty"`
+}
+
+type ForwardSyslog struct {
+	Address    string `json:"address"`     // host:6514
+	CAFile     string `json:"ca_file"`     // optional; system roots otherwise
+	ServerName string `json:"server_name"` // optional TLS name override
+	// Plaintext TCP, only for a relay on this host (e.g. 127.0.0.1:514).
+	Plaintext bool `json:"plaintext"`
+}
+
+type ForwardHTTP struct {
+	URL      string `json:"url"`       // https://
+	Format   string `json:"format"`    // "ndjson" (default) | "splunk_hec"
+	TokenEnv string `json:"token_env"` // env var holding the token (see /etc/nethergate/env)
+}
+
+// Metrics exposes Prometheus metrics from the watch daemon.
+type Metrics struct {
+	// e.g. "127.0.0.1:9464"; empty disables. Loopback only unless
+	// allow_remote is set (put a TLS proxy or an OTel collector in front).
+	Listen      string `json:"listen"`
+	AllowRemote bool   `json:"allow_remote"`
+}
+
 type Notify struct {
 	// Slack/Discord-compatible incoming webhook URL (optional).
 	WebhookURL string `json:"webhook_url"`
@@ -118,6 +148,8 @@ type Config struct {
 	Triage          Triage          `json:"triage"`
 	Notify          Notify          `json:"notify"`
 	Playbook        Playbook        `json:"playbook"`
+	Forward         Forward         `json:"forward"`
+	Metrics         Metrics         `json:"metrics"`
 
 	AllowPrefixes []netip.Prefix `json:"-"`
 }
@@ -144,6 +176,7 @@ func Default() *Config {
 		EnforcerSocket:   "/run/nethergate/enforcer.sock",
 		Window:           Duration(24 * time.Hour),
 		AuditAnchor:      AuditAnchor{Interval: Duration(5 * time.Minute)},
+		Forward:          Forward{Interval: Duration(5 * time.Second)},
 		MaxScanBytes:     64 << 20,
 		Policy: Policy{
 			DryRun:           true,
@@ -213,6 +246,38 @@ func (c *Config) Validate() error {
 				errs = append(errs, errors.New("enforcer_clients: uid 0 is always admin"))
 			}
 			roles[u] = role
+		}
+	}
+	if c.Forward.Interval <= 0 {
+		errs = append(errs, errors.New("forward.interval must be > 0"))
+	}
+	if f := c.Forward.Syslog; f != nil {
+		host, _, err := net.SplitHostPort(f.Address)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("forward.syslog.address: %w", err))
+		case f.Plaintext:
+			if ip, err := netip.ParseAddr(host); (err != nil || !ip.IsLoopback()) && host != "localhost" {
+				errs = append(errs, errors.New("forward.syslog.plaintext is only allowed to a loopback relay; use TLS to reach another host"))
+			}
+		}
+	}
+	if f := c.Forward.HTTP; f != nil {
+		if u, err := url.Parse(f.URL); err != nil || u.Scheme != "https" || u.Host == "" {
+			errs = append(errs, errors.New("forward.http.url must be an https:// URL"))
+		}
+		if f.Format != "" && f.Format != "ndjson" && f.Format != "splunk_hec" {
+			errs = append(errs, errors.New("forward.http.format must be ndjson or splunk_hec"))
+		}
+	}
+	if m := c.Metrics.Listen; m != "" {
+		host, _, err := net.SplitHostPort(m)
+		ip, perr := netip.ParseAddr(host)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Errorf("metrics.listen: %w", err))
+		case !c.Metrics.AllowRemote && host != "localhost" && (perr != nil || !ip.IsLoopback()):
+			errs = append(errs, errors.New("metrics.listen must be a loopback address unless metrics.allow_remote is set"))
 		}
 	}
 	if c.AuditAnchor.Interval <= 0 {
