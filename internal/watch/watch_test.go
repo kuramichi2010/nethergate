@@ -15,6 +15,7 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/detect"
 	"github.com/kuramichi2010/nethergate/internal/enforce"
 	"github.com/kuramichi2010/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/logscan"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
@@ -89,7 +90,7 @@ func TestScanSkipsMissingLogAndPartialLine(t *testing.T) {
 	cfg := config.Default()
 	cfg.Logs = []config.LogSource{{Path: filepath.Join(dir, "missing.log"), Format: "sshd"}, {Path: p, Format: "nginx"}}
 	cfg.MaxScanBytes = int64(len(line)*2 + 5) // lands mid-line
-	a, err := Scan(cfg, nil, now)
+	a, err := logscan.Scan(cfg, nil, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +136,7 @@ func TestPlaybookAutoBlockSkipsAIAndUsesRuleTTL(t *testing.T) {
 	}
 	select {
 	case req := <-got:
-		if req.IP != ip.String() || req.TTL != 6*time.Hour || req.Actor != "playbook" || !strings.Contains(req.Reason, "r1") {
+		if req.IP != ip.String() || req.TTL != 6*time.Hour || req.RuleID != "r1" {
 			t.Fatalf("%+v", req)
 		}
 	case <-time.After(2 * time.Second):

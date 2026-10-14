@@ -380,7 +380,7 @@ func (s *Server) blockIP(ctx context.Context, raw json.RawMessage) (any, error) 
 			return nil, fmt.Errorf("invalid ttl")
 		}
 	}
-	resp, err := s.Enforce(enforce.Request{Op: "block", IP: ip.String(), TTL: ttl, Actor: "ai",
+	resp, err := s.Enforce(enforce.Request{Op: "block", IP: ip.String(), TTL: ttl,
 		Reason: sanitize.Untrusted(p.Reason)})
 	if err != nil {
 		return nil, err
@@ -397,7 +397,7 @@ func (s *Server) unblockIP(ctx context.Context, raw json.RawMessage) (any, error
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.Enforce(enforce.Request{Op: "unblock", IP: ip.String(), Actor: "ai", Reason: sanitize.Untrusted(p.Reason)}); err != nil {
+	if _, err := s.Enforce(enforce.Request{Op: "unblock", IP: ip.String(), Reason: sanitize.Untrusted(p.Reason)}); err != nil {
 		return nil, err
 	}
 	return map[string]any{"unblocked": ip.String()}, nil

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/detect"
 	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/logscan"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 	"github.com/kuramichi2010/nethergate/internal/sanitize"
 )
@@ -62,7 +64,7 @@ func (d *Daemon) loadRules() []*playbook.Rule {
 }
 
 func (d *Daemon) Run(ctx context.Context) error {
-	a, err := Scan(d.Cfg, d.loadRules(), time.Now())
+	a, err := logscan.Scan(d.Cfg, d.loadRules(), time.Now())
 	if err != nil {
 		return err
 	}
@@ -78,6 +80,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for _, s := range d.Cfg.Logs {
 		d.tailers = append(d.tailers, &tailer{src: s})
 	}
+	go d.anchorLoop(ctx)
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
 	for {
@@ -137,7 +140,7 @@ func (d *Daemon) handle(ctx context.Context, inc *detect.Incident, now time.Time
 			}
 			handledByPlaybook = true
 			if now.After(d.blocked[inc.IP]) {
-				d.block(inc, m.Rule.EffectiveTTL(p.DefaultTTL.D()), "playbook",
+				d.block(inc, m.Rule.EffectiveTTL(p.DefaultTTL.D()), m.ID,
 					fmt.Sprintf("playbook rule %s (%s)", m.ID, m.Name), now)
 			}
 			break
@@ -147,7 +150,7 @@ func (d *Daemon) handle(ctx context.Context, inc *detect.Incident, now time.Time
 	// Never for a successful SSH login: that may be the administrator, so a
 	// human decides (they are notified below).
 	if p.AutoBlockScore > 0 && inc.Score >= p.AutoBlockScore && inc.SSHSuccess == 0 && now.After(d.blocked[inc.IP]) {
-		d.block(inc, p.DefaultTTL.D(), "rules", fmt.Sprintf("score %d: %s", inc.Score, inc.Actor.Type), now)
+		d.block(inc, p.DefaultTTL.D(), "", fmt.Sprintf("score %d: %s", inc.Score, inc.Actor.Type), now)
 	}
 	// 2. Tell humans when an incident crosses a new severity band.
 	if band := inc.Score / 25; band > d.notified[inc.IP] {
@@ -175,6 +178,31 @@ func (d *Daemon) handle(ctx context.Context, inc *detect.Incident, now time.Time
 		defer func() { <-d.triageBusy }()
 		d.runTriage(ctx, ip, score)
 	}()
+}
+
+// anchorLoop publishes the heads of every audit log this user can read
+// (including the enforcer's, which is group-readable) to the journal and
+// the optional anchor URL.
+func (d *Daemon) anchorLoop(ctx context.Context) {
+	pub := &audit.Publisher{URL: d.Cfg.AuditAnchor.URL}
+	files := []string{
+		filepath.Join(d.Cfg.StateDir, "watch-audit.jsonl"),
+		filepath.Join(d.Cfg.StateDir, "mcp-audit.jsonl"),
+		filepath.Join(d.Cfg.StateDir, "playbook-audit.jsonl"),
+		filepath.Join(d.Cfg.EnforcerStateDir, "enforcer-audit.jsonl"),
+	}
+	t := time.NewTicker(d.Cfg.AuditAnchor.Interval.D())
+	defer t.Stop()
+	for {
+		for _, f := range files {
+			pub.PublishFile(f)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 // announceReviews tells humans about cases the AI could not decide.
@@ -210,15 +238,18 @@ func (d *Daemon) announceReviews() {
 	}
 }
 
-func (d *Daemon) block(inc *detect.Incident, ttl time.Duration, actor, reason string, now time.Time) {
+// block asks the enforcer for a block. ruleID names the playbook rule that
+// triggered it ("" for a score-based block); the enforcer re-checks either
+// against the logs and derives the actor from our UID.
+func (d *Daemon) block(inc *detect.Incident, ttl time.Duration, ruleID, reason string, now time.Time) {
 	_, err := enforce.Call(d.Cfg.EnforcerSocket, enforce.Request{
-		Op: "block", IP: inc.IP.String(), TTL: ttl, Actor: actor, Reason: reason,
+		Op: "block", IP: inc.IP.String(), TTL: ttl, RuleID: ruleID, Reason: reason,
 	})
 	// Back off either way so a refused block is not retried every tick,
 	// but retry a failure (e.g. enforcer restarting) sooner than the TTL.
 	backoff := ttl
 	if err != nil {
-		log.Printf("auto-block %s (%s): %v", inc.IP, actor, err)
+		log.Printf("auto-block %s (rule %q): %v", inc.IP, ruleID, err)
 		backoff = min(backoff, 5*time.Minute)
 	}
 	d.blocked[inc.IP] = now.Add(backoff)

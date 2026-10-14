@@ -26,7 +26,8 @@ type Engine struct {
 	allow  []netip.Prefix
 	now    func() time.Time
 	mu     sync.Mutex
-	recent []time.Time
+	recent []time.Time            // all automated blocks (global cap)
+	byActr map[string][]time.Time // per-actor quota
 	// Allow-rule prefixes approved by humans in the playbook (reloadable).
 	extra []netip.Prefix
 }
@@ -61,6 +62,16 @@ func New(cfg config.Policy, allow []netip.Prefix) *Engine {
 }
 
 var ErrRateLimited = errors.New("block rate limit reached; escalate to a human")
+
+func prune(ts []time.Time, cut time.Time) []time.Time {
+	kept := ts[:0]
+	for _, t := range ts {
+		if t.After(cut) {
+			kept = append(kept, t)
+		}
+	}
+	return kept
+}
 
 // MinTTL keeps nft from receiving "timeout 0s" for sub-second TTLs.
 const MinTTL = time.Minute
@@ -121,18 +132,25 @@ func (e *Engine) Check(a *Action) (netip.Addr, time.Duration, error) {
 	if p, ok := e.allowedLocked(ip); ok {
 		return netip.Addr{}, 0, fmt.Errorf("%s is allowlisted (%s)", ip, p)
 	}
+	// Humans are accountable and must be able to act during an incident.
+	if a.Actor == "human" {
+		return ip, ttl, nil
+	}
 	now := e.now()
 	cut := now.Add(-time.Hour)
-	kept := e.recent[:0]
-	for _, t := range e.recent {
-		if t.After(cut) {
-			kept = append(kept, t)
-		}
+	if e.byActr == nil {
+		e.byActr = map[string][]time.Time{}
 	}
-	e.recent = kept
+	e.recent = prune(e.recent, cut)
+	mine := prune(e.byActr[a.Actor], cut)
+	e.byActr[a.Actor] = mine
+	if q := e.cfg.QuotaPerHour[a.Actor]; q <= 0 || len(mine) >= q {
+		return netip.Addr{}, 0, fmt.Errorf("%w (%s quota %d/h)", ErrRateLimited, a.Actor, q)
+	}
 	if len(e.recent) >= e.cfg.MaxBlocksPerHour {
 		return netip.Addr{}, 0, ErrRateLimited
 	}
 	e.recent = append(e.recent, now)
+	e.byActr[a.Actor] = append(mine, now)
 	return ip, ttl, nil
 }

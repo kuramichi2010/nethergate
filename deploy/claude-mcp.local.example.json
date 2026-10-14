@@ -1,8 +1,9 @@
 {
+  "_comment": "Local triage (AI CLI on the same host, launched by nethergate watch as ng-watch). The MCP server must run as ng-mcp, not ng-watch: the enforcer derives the actor from the caller's uid, and nethergate mcp refuses to start under the watch uid. SSH to localhost switches the user without sudo (which NoNewPrivileges forbids). Put the key in /home/ng-watch/.ssh and authorize it for ng-mcp with from=\"127.0.0.1,::1\".",
   "mcpServers": {
     "nethergate": {
-      "command": "/usr/local/bin/nethergate",
-      "args": ["-config", "/etc/nethergate/config.json", "mcp"]
+      "command": "ssh",
+      "args": ["-T", "-i", "/home/ng-watch/.ssh/nethergate_mcp", "-o", "BatchMode=yes", "ng-mcp@127.0.0.1"]
     }
   }
 }

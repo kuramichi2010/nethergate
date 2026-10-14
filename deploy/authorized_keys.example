@@ -1,4 +1,4 @@
-# /home/ng-agent/.ssh/authorized_keys (or AuthorizedKeysFile for ng-agent)
+# /home/ng-mcp/.ssh/authorized_keys (or AuthorizedKeysFile for ng-mcp)
 # The key can ONLY start the MCP server: no shell, no forwarding, no pty.
 # Restrict "from=" to your management host's address.
 restrict,from="192.0.2.10",command="/usr/local/bin/nethergate -config /etc/nethergate/config.json mcp" ssh-ed25519 AAAA...replace... nethergate-agent

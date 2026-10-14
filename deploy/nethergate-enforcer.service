@@ -5,12 +5,14 @@ After=nftables.service network.target
 [Service]
 User=ng-enforcer
 Group=nethergate
+# Read the logs to re-authorise automated blocks itself.
+SupplementaryGroups=adm
 ExecStart=/usr/local/bin/nethergate -config /etc/nethergate/config.json enforcer
 RuntimeDirectory=nethergate
 RuntimeDirectoryMode=0750
 # Own directory (= enforcer_state_dir): sharing StateDirectory=nethergate with
 # the watch service would make systemd chown it, and the enforcer's audit log
-# inside it, to ng-agent whenever the watch service starts.
+# inside it, to ng-watch whenever the watch service starts.
 StateDirectory=nethergate-enforcer
 StateDirectoryMode=0750
 UMask=0027

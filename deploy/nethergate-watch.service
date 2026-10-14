@@ -4,14 +4,16 @@ After=nethergate-enforcer.service
 Wants=nethergate-enforcer.service
 
 [Service]
-User=ng-agent
+User=ng-watch
 Group=nethergate
 SupplementaryGroups=adm
 ExecStart=/usr/local/bin/nethergate -config /etc/nethergate/config.json watch
 # Optional secrets, e.g. ABUSEIPDB_KEY=... (chmod 600, root-owned)
 EnvironmentFile=-/etc/nethergate/env
 StateDirectory=nethergate
-StateDirectoryMode=0750
+# 1770: ng-mcp (group nethergate) writes its audit log, reviews and
+# proposals here too; the sticky bit stops each user deleting the other's files.
+StateDirectoryMode=1770
 UMask=0027
 Restart=on-failure
 
@@ -33,7 +35,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 # The triage command runs inside this sandbox. A Node.js based CLI (claude,
 # codex) needs a JIT and a writable home: if you enable triage.command, drop
-# MemoryDenyWriteExecute and add e.g. ReadWritePaths=/home/ng-agent/.claude
+# MemoryDenyWriteExecute and add e.g. ReadWritePaths=/home/ng-watch/.claude
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native

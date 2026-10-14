@@ -2,7 +2,7 @@
   "mcpServers": {
     "nethergate": {
       "command": "ssh",
-      "args": ["-T", "-i", "~/.ssh/nethergate_agent", "-o", "BatchMode=yes", "ng-agent@server.example.com"]
+      "args": ["-T", "-i", "~/.ssh/nethergate_agent", "-o", "BatchMode=yes", "ng-mcp@server.example.com"]
     }
   }
 }

@@ -12,12 +12,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/detect"
 	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/logscan"
 	"github.com/kuramichi2010/nethergate/internal/mcp"
 	"github.com/kuramichi2010/nethergate/internal/osint"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
@@ -58,7 +62,7 @@ func usage() {
 func main() {
 	cfgPath := flag.String("config", "/etc/nethergate/config.json", "config file")
 	flag.Parse()
-	multi := map[string]bool{"playbook": true, "review": true, "correct": true}
+	multi := map[string]bool{"playbook": true, "review": true, "correct": true, "verify": true}
 	if flag.NArg() < 1 || (flag.NArg() > 1 && !multi[flag.Arg(0)]) {
 		usage()
 	}
@@ -89,7 +93,29 @@ func main() {
 	switch cmd {
 	case "enforcer":
 		a := openAudit(cfg.EnforcerStateDir, "enforcer-audit.jsonl")
-		srv := enforce.NewServer(policy.New(cfg.Policy, cfg.AllowPrefixes), a, cfg.EnforcerClientUIDs, cfg.Policy.DryRun)
+		srv := enforce.NewServer(policy.New(cfg.Policy, cfg.AllowPrefixes), a, cfg.EnforcerClients, cfg.Policy, cfg.Policy.DryRun)
+		// Automated blocks are re-authorised from the logs, not from the caller.
+		srv.Verify = func(ip netip.Addr) (*detect.Incident, []*playbook.Rule, error) {
+			rules, errs := playbook.Load(cfg.Playbook.Path)
+			for _, err := range errs {
+				log.Printf("playbook: %v", err)
+			}
+			an, err := logscan.ScanIP(cfg, rules, ip, time.Now())
+			if err != nil {
+				return nil, nil, err
+			}
+			return an.Get(ip), rules, nil
+		}
+		// The enforcer has no network access: its anchors go to the journal.
+		pub := &audit.Publisher{}
+		auditPath := filepath.Join(cfg.EnforcerStateDir, "enforcer-audit.jsonl")
+		srv.OnAudit = func() { n, h := a.Head(); pub.Publish(auditPath, n, h) }
+		go func() {
+			for {
+				srv.OnAudit()
+				time.Sleep(cfg.AuditAnchor.Interval.D())
+			}
+		}()
 		srv.StatePath = filepath.Join(cfg.EnforcerStateDir, "blocks.json")
 		srv.PlaybookPath = cfg.Playbook.Path
 		if err := srv.LoadState(); err != nil {
@@ -98,6 +124,7 @@ func main() {
 		go func() { <-ctx.Done(); os.Remove(cfg.EnforcerSocket); os.Exit(0) }()
 		log.Fatal(srv.Serve(cfg.EnforcerSocket))
 	case "watch":
+		mustRunAs(cfg, "watch", cfg.EnforcerClients.WatchUIDs)
 		d := &watch.Daemon{Cfg: cfg, Audit: openAudit(cfg.StateDir, "watch-audit.jsonl")}
 		if err := d.Run(ctx); err != nil {
 			log.Fatal(err)
@@ -105,6 +132,7 @@ func main() {
 	case "mcp":
 		// stdout is the protocol channel: logs must go to stderr only.
 		log.SetOutput(os.Stderr)
+		mustRunAs(cfg, "mcp", cfg.EnforcerClients.MCPUIDs)
 		var oc *osint.Client
 		if cfg.OSINT.Enabled {
 			oc = osint.New(cfg.OSINT.AbuseIPDBKeyEnv)
@@ -115,7 +143,7 @@ func main() {
 		}
 		s := &mcp.Server{
 			Cfg: cfg, Audit: openAudit(cfg.StateDir, "mcp-audit.jsonl"), OSINT: oc, Rules: rules,
-			Scan:    func(r []*playbook.Rule) (*detect.Analyzer, error) { return watch.Scan(cfg, r, time.Now()) },
+			Scan:    func(r []*playbook.Rule) (*detect.Analyzer, error) { return logscan.Scan(cfg, r, time.Now()) },
 			Enforce: func(r enforce.Request) (enforce.Response, error) { return enforce.Call(cfg.EnforcerSocket, r) },
 		}
 		if err := s.Serve(ctx, os.Stdin, os.Stdout); err != nil {
@@ -126,7 +154,7 @@ func main() {
 		for _, err := range errs {
 			log.Printf("playbook: %v", err)
 		}
-		a, err := watch.Scan(cfg, rules, time.Now())
+		a, err := logscan.Scan(cfg, rules, time.Now())
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -149,28 +177,78 @@ func main() {
 			os.Exit(1)
 		}
 	case "verify":
-		bad := false
-		for _, p := range []string{
-			filepath.Join(cfg.EnforcerStateDir, "enforcer-audit.jsonl"),
-			filepath.Join(cfg.StateDir, "watch-audit.jsonl"),
-			filepath.Join(cfg.StateDir, "mcp-audit.jsonl"),
-			filepath.Join(cfg.StateDir, "playbook-audit.jsonl"),
-		} {
-			if _, err := os.Stat(p); os.IsNotExist(err) {
-				continue
-			}
-			cnt, err := audit.Verify(p)
-			if err != nil {
-				bad = true
-				fmt.Printf("%s: TAMPERED after %d valid records: %v\n", p, cnt, err)
-			} else {
-				fmt.Printf("%s: ok (%d records)\n", p, cnt)
-			}
-		}
-		if bad {
+		if err := runVerify(cfg, flag.Args()[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
 	default:
 		usage()
 	}
+}
+
+// runVerify checks every audit chain and, with -anchors, that the logs
+// still contain the heads published earlier (journal / SIEM export).
+func runVerify(cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	anchorFile := fs.String("anchors", "", "file with NETHERGATE-ANCHOR lines (e.g. journalctl -u 'nethergate-*' output)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	var anchors map[string][]audit.Anchor
+	if *anchorFile != "" {
+		f, err := os.Open(*anchorFile)
+		if err != nil {
+			return err
+		}
+		anchors, err = audit.ParseAnchors(f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	bad := false
+	for _, p := range []string{
+		filepath.Join(cfg.EnforcerStateDir, "enforcer-audit.jsonl"),
+		filepath.Join(cfg.StateDir, "watch-audit.jsonl"),
+		filepath.Join(cfg.StateDir, "mcp-audit.jsonl"),
+		filepath.Join(cfg.StateDir, "playbook-audit.jsonl"),
+	} {
+		want := anchors[filepath.Base(p)]
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			if len(want) > 0 {
+				bad = true
+				fmt.Printf("%s: MISSING but %d anchors were published for it (deleted)\n", p, len(want))
+			}
+			continue
+		}
+		cnt, err := audit.VerifyAnchors(p, want)
+		switch {
+		case err != nil:
+			bad = true
+			fmt.Printf("%s: TAMPERED after %d valid records: %v\n", p, cnt, err)
+		case len(want) > 0:
+			fmt.Printf("%s: ok (%d records, %d anchors match)\n", p, cnt, len(want))
+		default:
+			fmt.Printf("%s: ok (%d records, no anchors checked)\n", p, cnt)
+		}
+	}
+	if bad {
+		return errors.New("audit verification failed")
+	}
+	return nil
+}
+
+// mustRunAs stops a daemon that would reach the enforcer with the wrong
+// role: e.g. an MCP server (the AI) running as root would be treated as a
+// human, and one running as the watch user as the rule engine.
+func mustRunAs(cfg *config.Config, role string, uids []int) {
+	uid := os.Getuid()
+	if slices.Contains(uids, uid) {
+		return
+	}
+	c := cfg.EnforcerClients
+	if uid == 0 || slices.Contains(c.AdminUIDs, uid) || slices.Contains(c.WatchUIDs, uid) || slices.Contains(c.MCPUIDs, uid) {
+		log.Fatalf("refusing to run %s as uid %d: that uid has another role at the enforcer; run it as one of enforcer_clients.%s_uids %v", role, uid, role, uids)
+	}
+	log.Printf("warning: uid %d is not in enforcer_clients.%s_uids; the enforcer will refuse its requests", uid, role)
 }

@@ -35,7 +35,73 @@ type Log struct {
 	mu   sync.Mutex
 	path string
 	last string
+	n    int   // number of records in the chain
 	size int64 // file size right after our last read/write of the head
+}
+
+// Head returns the record count and hash of the newest record: an anchor
+// value that, once published elsewhere, pins the log up to that point.
+func (l *Log) Head() (int, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.n, l.last
+}
+
+// HeadOf reads the current head of the log at path.
+func HeadOf(path string) (int, string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	l := &Log{path: path}
+	if err := l.readHead(f); err != nil {
+		return 0, "", err
+	}
+	return l.n, l.last, nil
+}
+
+// Anchor is a published (count, hash) pair for one log file.
+type Anchor struct {
+	N    int    `json:"n"`
+	Hash string `json:"hash"`
+}
+
+// VerifyAnchors checks the chain and that record N of each anchor still has
+// the published hash. A log truncated below N, or rewritten from an
+// earlier point (even with a valid new chain), fails.
+func VerifyAnchors(path string, anchors []Anchor) (int, error) {
+	n, err := Verify(path)
+	if err != nil {
+		return n, err
+	}
+	want := map[int]string{}
+	for _, a := range anchors {
+		if a.N > n {
+			return n, fmt.Errorf("anchor at record %d but the log has only %d records (truncated)", a.N, n)
+		}
+		want[a.N] = a.Hash
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return n, err
+	}
+	defer f.Close()
+	i := 0
+	err = eachLine(f, func(line []byte) error {
+		i++
+		h, ok := want[i]
+		if !ok {
+			return nil
+		}
+		var r Record
+		_ = json.Unmarshal(line, &r)
+		if r.Hash != h {
+			return fmt.Errorf("record %d does not match the published anchor (log rewritten)", i)
+		}
+		return nil
+	})
+	return n, err
 }
 
 func Open(path string) (*Log, error) {
@@ -59,11 +125,12 @@ func (l *Log) readHead(f *os.File) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	l.last, l.size = "", 0
+	l.last, l.size, l.n = "", 0, 0
 	err := eachLine(f, func(line []byte) error {
 		var r Record
 		if json.Unmarshal(line, &r) == nil {
 			l.last = r.Hash
+			l.n++
 		}
 		return nil
 	})
@@ -149,6 +216,7 @@ func (l *Log) Write(actor, action string, detail any, result string) error {
 		return err
 	}
 	l.last = r.Hash
+	l.n++
 	l.size += int64(n)
 	return nil
 }

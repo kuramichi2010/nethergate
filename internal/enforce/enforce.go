@@ -1,8 +1,16 @@
 // Package enforce is the only privileged component. It runs as a separate
-// process with CAP_NET_ADMIN, listens on a Unix socket, checks the peer's
-// UID, validates every request against the policy, and then adds/removes
+// process with CAP_NET_ADMIN, listens on a Unix socket, and adds/removes
 // single addresses in an nftables set with a timeout. It never runs a shell
 // and accepts no free-form commands.
+//
+// It trusts none of its callers:
+//   - the actor is derived from the caller's UID (watch → rules/playbook,
+//     mcp → ai, admin/root → human), never from the request;
+//   - automated blocks are re-authorised from the logs by the enforcer
+//     itself (the incident score, or the playbook rule that triggered);
+//   - the AI can only lift blocks the AI placed;
+//   - every firewall change is written to the audit log first, and is
+//     refused if the audit log cannot be written (fail closed).
 package enforce
 
 import (
@@ -23,6 +31,8 @@ import (
 	"time"
 
 	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/detect"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 	"github.com/kuramichi2010/nethergate/internal/policy"
 	"github.com/kuramichi2010/nethergate/internal/sanitize"
@@ -39,8 +49,26 @@ type Request struct {
 	IP     string        `json:"ip,omitempty"`
 	TTL    time.Duration `json:"ttl,omitempty"`
 	Reason string        `json:"reason,omitempty"`
-	Actor  string        `json:"actor,omitempty"`
+	// Watch only: the approved playbook rule that triggered this block.
+	RuleID string `json:"rule_id,omitempty"`
 }
+
+type Role int
+
+const (
+	RoleNone Role = iota
+	RoleWatch
+	RoleMCP
+	RoleAdmin
+)
+
+// Verifier re-derives the incident for ip from the logs, together with the
+// approved playbook rules used. A nil incident means no activity.
+type Verifier func(ip netip.Addr) (*detect.Incident, []*playbook.Rule, error)
+
+// owner precedence: a block keeps its strongest owner when extended, so
+// the AI cannot take over (and then lift) a block placed by rules or people.
+var rank = map[string]int{"ai": 1, "rules": 2, "playbook": 3, "human": 4}
 
 type Block struct {
 	IP      string    `json:"ip"`
@@ -57,10 +85,18 @@ type Response struct {
 }
 
 type Server struct {
-	Policy    *policy.Engine
-	Audit     *audit.Log
-	AllowUIDs []int
-	DryRun    bool
+	Policy  *policy.Engine
+	Audit   *audit.Log
+	Clients config.EnforcerClients
+	DryRun  bool
+	// Thresholds used to re-authorise automated blocks.
+	Thresholds config.Policy
+	// Verify re-derives incidents from the logs. Required for automated
+	// blocks; if nil or failing, they are refused (fail closed).
+	Verify Verifier
+	// OnAudit is called after records are appended (e.g. to publish the
+	// chain head as an external anchor).
+	OnAudit func()
 	// StatePath persists active blocks so a restarted enforcer can still
 	// list and unblock them (and re-installs them after a reboot).
 	StatePath string
@@ -73,8 +109,21 @@ type Server struct {
 	blocks       map[string]Block
 }
 
-func NewServer(p *policy.Engine, a *audit.Log, uids []int, dryRun bool) *Server {
-	return &Server{Policy: p, Audit: a, AllowUIDs: uids, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}}
+func NewServer(p *policy.Engine, a *audit.Log, clients config.EnforcerClients, thresholds config.Policy, dryRun bool) *Server {
+	return &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}}
+}
+
+// RoleOf maps a peer UID to its role. Root is always admin.
+func (s *Server) RoleOf(uid int) Role {
+	switch {
+	case uid == 0 || slices.Contains(s.Clients.AdminUIDs, uid):
+		return RoleAdmin
+	case slices.Contains(s.Clients.WatchUIDs, uid):
+		return RoleWatch
+	case slices.Contains(s.Clients.MCPUIDs, uid):
+		return RoleMCP
+	}
+	return RoleNone
 }
 
 func nft(args ...string) error {
@@ -86,8 +135,6 @@ func nft(args ...string) error {
 	}
 	return nil
 }
-
-var actors = []string{"rules", "playbook", "ai", "human"}
 
 func setFor(ip netip.Addr) string {
 	if ip.Is4() {
@@ -206,7 +253,11 @@ func (s *Server) handle(c *net.UnixConn) {
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
 	uid, err := peerUID(c)
-	if err != nil || (uid != 0 && !slices.Contains(s.AllowUIDs, uid)) {
+	role := RoleNone
+	if err == nil {
+		role = s.RoleOf(uid)
+	}
+	if role == RoleNone {
 		_ = s.Audit.Write(fmt.Sprintf("uid:%d", uid), "connect", nil, "denied: uid not allowed")
 		_ = json.NewEncoder(c).Encode(Response{Error: "permission denied"})
 		return
@@ -217,11 +268,40 @@ func (s *Server) handle(c *net.UnixConn) {
 		_ = json.NewEncoder(c).Encode(Response{Error: "bad request"})
 		return
 	}
-	_ = json.NewEncoder(c).Encode(s.Do(req))
+	_ = json.NewEncoder(c).Encode(s.Do(role, req))
 }
 
-// Do executes one validated request. Exported for tests and in-process use.
-func (s *Server) Do(req Request) Response {
+// Do executes one request from a caller with the given role.
+func (s *Server) Do(role Role, req Request) Response {
+	var actor string
+	switch role {
+	case RoleAdmin:
+		actor = "human"
+	case RoleMCP:
+		actor = "ai"
+	case RoleWatch:
+		actor = "rules"
+		if req.RuleID != "" {
+			actor = "playbook"
+		}
+	default:
+		return Response{Error: "permission denied"}
+	}
+	if req.RuleID != "" && role != RoleWatch {
+		return Response{Error: "rule_id is only accepted from the watch daemon"}
+	}
+	// Both end up in the audit log and are shown back to the AI via "list".
+	req.Reason = sanitize.Untrusted(req.Reason)
+	req.RuleID = sanitize.Untrusted(req.RuleID)
+
+	// Re-authorise automated blocks from the logs before taking the lock
+	// (scanning can take a moment).
+	var authErr error
+	var ruleTTL time.Duration
+	if req.Op == "block" && actor != "human" {
+		ruleTTL, authErr = s.authorize(actor, req)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.expire()
@@ -233,26 +313,49 @@ func (s *Server) Do(req Request) Response {
 		}
 		return Response{OK: true, DryRun: s.DryRun, Blocks: out}
 	}
-	// Both end up in the audit log and are shown back to the AI via "list".
-	req.Reason = sanitize.Untrusted(req.Reason)
-	if !slices.Contains(actors, req.Actor) {
-		req.Actor = sanitize.Untrusted(req.Actor)
-		_ = s.Audit.Write(req.Actor, req.Op, req, "rejected: unknown actor")
-		return Response{Error: fmt.Sprintf("unknown actor %q", req.Actor)}
-	}
-	act := policy.Action{Kind: req.Op, IP: req.IP, TTL: req.TTL, Reason: req.Reason, Actor: req.Actor}
-	ip, ttl, err := s.Policy.Check(&act)
-	if err != nil {
-		_ = s.Audit.Write(req.Actor, req.Op, req, "rejected: "+err.Error())
+	reject := func(err error) Response {
+		_ = s.Audit.Write(actor, req.Op, req, "rejected: "+err.Error())
 		return Response{Error: err.Error()}
 	}
+	if authErr != nil {
+		return reject(authErr)
+	}
+	if req.Op == "unblock" {
+		if role == RoleWatch {
+			return reject(errors.New("the watch daemon cannot unblock"))
+		}
+		if ip, err := policy.ParseAddr(req.IP); err == nil {
+			if b, ok := s.blocks[ip.String()]; ok && actor == "ai" && b.Actor != "ai" {
+				return reject(fmt.Errorf("block on %s was placed by %s; only a human can lift it", ip, b.Actor))
+			}
+		}
+	}
+	act := policy.Action{Kind: req.Op, IP: req.IP, TTL: req.TTL, Reason: req.Reason, Actor: actor}
+	ip, ttl, err := s.Policy.Check(&act)
+	if err != nil {
+		return reject(err)
+	}
+	if ruleTTL > 0 {
+		ttl = min(ttl, ruleTTL)
+	}
 	key := ip.String()
+	detail := map[string]any{"ip": key, "ttl": ttl.String(), "reason": req.Reason, "rule_id": req.RuleID}
+
 	switch req.Op {
 	case "block":
 		expires := time.Now().Add(ttl)
 		old, exists := s.blocks[key]
 		if exists && !old.Expires.Before(expires) {
-			break // already blocked at least this long; keep the longer block
+			return Response{OK: true, DryRun: s.DryRun} // already blocked at least this long
+		}
+		owner := actor
+		if exists && rank[old.Actor] > rank[actor] {
+			owner = old.Actor // extending keeps the stronger owner
+		}
+		// Fail closed: no firewall change that is not in the audit log.
+		if err := s.Audit.Write(actor, "block_intent", detail, "pending"); err != nil {
+			log.Printf("audit unavailable, refusing block of %s: %v", key, err)
+			return Response{Error: "audit log unavailable; refusing to change the firewall"}
 		}
 		if !s.DryRun {
 			if exists {
@@ -263,13 +366,18 @@ func (s *Server) Do(req Request) Response {
 			err = s.runNft("add", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s timeout %ds }", key, int(ttl.Seconds())))
 		}
 		if err == nil {
-			s.blocks[key] = Block{IP: key, Expires: expires, Reason: req.Reason, Actor: req.Actor}
+			s.blocks[key] = Block{IP: key, Expires: expires, Reason: req.Reason, Actor: owner}
 			s.saveState()
 		}
 	case "unblock":
 		if _, ok := s.blocks[key]; !ok {
-			err = errors.New("not currently blocked by nethergate")
-		} else if !s.DryRun {
+			return reject(errors.New("not currently blocked by nethergate"))
+		}
+		if err := s.Audit.Write(actor, "unblock_intent", detail, "pending"); err != nil {
+			log.Printf("audit unavailable, refusing unblock of %s: %v", key, err)
+			return Response{Error: "audit log unavailable; refusing to change the firewall"}
+		}
+		if !s.DryRun {
 			err = s.runNft("delete", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s }", key))
 		}
 		if err == nil {
@@ -284,11 +392,68 @@ func (s *Server) Do(req Request) Response {
 	if err != nil {
 		result = "error: " + err.Error()
 	}
-	_ = s.Audit.Write(req.Actor, req.Op, map[string]any{"ip": key, "ttl": ttl.String(), "reason": req.Reason}, result)
+	if werr := s.Audit.Write(actor, req.Op, detail, result); werr != nil {
+		// The intent record is already in the log; make the gap visible.
+		log.Printf("AUDIT WRITE FAILED after %s %s (%s): %v", req.Op, key, result, werr)
+	}
+	if s.OnAudit != nil {
+		s.OnAudit()
+	}
 	if err != nil {
 		return Response{Error: err.Error()}
 	}
 	return Response{OK: true, DryRun: s.DryRun}
+}
+
+// authorize re-derives the incident behind an automated block. It returns
+// the TTL cap from the playbook rule, if one was used.
+func (s *Server) authorize(actor string, req Request) (time.Duration, error) {
+	ip, err := policy.ParseAddr(req.IP)
+	if err != nil {
+		return 0, err
+	}
+	if s.Verify == nil {
+		return 0, errors.New("incident verification unavailable; automated blocks are refused")
+	}
+	inc, rules, err := s.Verify(ip)
+	if err != nil {
+		return 0, fmt.Errorf("cannot verify incident from logs: %w", err)
+	}
+	if inc == nil {
+		return 0, fmt.Errorf("no activity from %s in the logs; refusing %s block", ip, actor)
+	}
+	t := s.Thresholds
+	switch actor {
+	case "ai":
+		if inc.Score < t.AIMinScore {
+			return 0, fmt.Errorf("incident score %d for %s is below ai_min_score %d", inc.Score, ip, t.AIMinScore)
+		}
+	case "rules":
+		if t.AutoBlockScore <= 0 || inc.Score < t.AutoBlockScore {
+			return 0, fmt.Errorf("incident score %d for %s is below auto_block_score %d", inc.Score, ip, t.AutoBlockScore)
+		}
+		if inc.SSHSuccess > 0 {
+			return 0, errors.New("successful SSH login from this source: a human must decide")
+		}
+	case "playbook":
+		if inc.SSHSuccess > 0 {
+			return 0, errors.New("successful SSH login from this source: a human must decide")
+		}
+		for _, r := range rules {
+			if r.ID != req.RuleID {
+				continue
+			}
+			if r.IsAllow() || !r.AutoBlock {
+				return 0, fmt.Errorf("playbook rule %s does not authorise automatic blocks", r.ID)
+			}
+			if _, triggered := inc.Hits(r); !triggered {
+				return 0, fmt.Errorf("playbook rule %s has not triggered for %s", r.ID, ip)
+			}
+			return r.EffectiveTTL(t.DefaultTTL.D()), nil
+		}
+		return 0, fmt.Errorf("no approved playbook rule %s", req.RuleID)
+	}
+	return 0, nil
 }
 
 // refreshAllow reloads playbook allow prefixes when the file changed and
@@ -326,6 +491,10 @@ func (s *Server) refreshAllow() {
 		}
 		p, ok := s.Policy.Allowed(ip)
 		if !ok {
+			continue
+		}
+		if werr := s.Audit.Write("playbook", "unblock_intent", map[string]any{"ip": key, "reason": "now allowlisted by " + p.String()}, "pending"); werr != nil {
+			log.Printf("audit unavailable, keeping block on %s: %v", key, werr)
 			continue
 		}
 		if !s.DryRun {

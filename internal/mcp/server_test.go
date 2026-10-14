@@ -107,7 +107,7 @@ func TestBlockOnlyAttackers(t *testing.T) {
 	if _, isErr := text(res[2]); !isErr {
 		t.Error("unknown argument accepted")
 	}
-	if len(*sent) != 1 || (*sent)[0].IP != "203.0.113.5" || (*sent)[0].TTL != 30*time.Minute || (*sent)[0].Actor != "ai" {
+	if len(*sent) != 1 || (*sent)[0].IP != "203.0.113.5" || (*sent)[0].TTL != 30*time.Minute {
 		t.Fatalf("enforcer got %+v", *sent)
 	}
 }

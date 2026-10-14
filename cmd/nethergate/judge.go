@@ -14,9 +14,9 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/audit"
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/logscan"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
 	"github.com/kuramichi2010/nethergate/internal/policy"
-	"github.com/kuramichi2010/nethergate/internal/watch"
 )
 
 const judgeUsage = `usage: nethergate review list
@@ -122,7 +122,7 @@ func judge(cfg *config.Config, ipStr, verdict string, rest []string, review *pla
 		lesson.PriorAction = "not blocked"
 	}
 	var involved []*playbook.Rule
-	if a, err := watch.Scan(cfg, approved, time.Now()); err == nil {
+	if a, err := logscan.Scan(cfg, approved, time.Now()); err == nil {
 		if inc := a.Get(ip); inc != nil {
 			for _, r := range approved {
 				// benign: malicious rules that fired wrongly; malicious: allow rules that hid it
@@ -180,7 +180,7 @@ func judge(cfg *config.Config, ipStr, verdict string, rest []string, review *pla
 		}
 		// The enforcer also lifts the block once it sees the allow rule;
 		// unblocking here makes it immediate (and covers -no-allow).
-		if _, err := enforce.Call(cfg.EnforcerSocket, enforce.Request{Op: "unblock", IP: key, Actor: "human", Reason: "marked benign: " + *note}); err == nil {
+		if _, err := enforce.Call(cfg.EnforcerSocket, enforce.Request{Op: "unblock", IP: key, Reason: "marked benign: " + *note}); err == nil {
 			fmt.Println("unblocked", key)
 		}
 	case "malicious":
@@ -209,7 +209,7 @@ func judge(cfg *config.Config, ipStr, verdict string, rest []string, review *pla
 		fmt.Printf("added %s rule %s\n", newRule.Verdict, newRule.ID)
 	}
 	if verdict == "malicious" {
-		_, err := enforce.Call(cfg.EnforcerSocket, enforce.Request{Op: "block", IP: key, TTL: *ttl, Actor: "human", Reason: "marked malicious: " + *note})
+		_, err := enforce.Call(cfg.EnforcerSocket, enforce.Request{Op: "block", IP: key, TTL: *ttl, Reason: "marked malicious: " + *note})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "block %s: %v\n", key, err)
 			if len(involved) > 0 && !*removeRules {

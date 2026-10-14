@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,5 +64,44 @@ func TestHugeRecordStaysReadable(t *testing.T) {
 	_ = l2.Write("ai", "x", nil, "ok")
 	if n, err := Verify(p); err != nil || n != 2 {
 		t.Fatalf("%d %v", n, err)
+	}
+}
+
+func TestAnchorsDetectTruncationAndRewrite(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "enforcer-audit.jsonl")
+	l, _ := Open(p)
+	for i := 0; i < 5; i++ {
+		_ = l.Write("ai", "block", map[string]any{"i": i}, "ok")
+	}
+	n, h := l.Head()
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "Oct 14 host nethergate[1]: %s file=enforcer-audit.jsonl n=%d hash=%s\n", AnchorMarker, n, h)
+	anchors, err := ParseAnchors(strings.NewReader(buf.String()))
+	if err != nil || len(anchors["enforcer-audit.jsonl"]) != 1 {
+		t.Fatalf("%v %v", anchors, err)
+	}
+	a := anchors["enforcer-audit.jsonl"]
+	if _, err := VerifyAnchors(p, a); err != nil {
+		t.Fatal(err)
+	}
+	// Attacker drops the last two records: the chain itself is still valid...
+	b, _ := os.ReadFile(p)
+	lines := strings.SplitAfter(string(b), "\n")
+	os.WriteFile(p, []byte(strings.Join(lines[:3], "")), 0o600)
+	if _, err := Verify(p); err != nil {
+		t.Fatalf("truncated chain should still self-verify: %v", err)
+	}
+	// ...but not against the published anchor.
+	if _, err := VerifyAnchors(p, a); err == nil {
+		t.Fatal("truncation not detected")
+	}
+	// Attacker rebuilds a fresh, internally valid chain of the same length.
+	os.Remove(p)
+	l2, _ := Open(p)
+	for i := 0; i < 5; i++ {
+		_ = l2.Write("human", "noop", nil, "ok")
+	}
+	if _, err := VerifyAnchors(p, a); err == nil {
+		t.Fatal("rewritten log not detected")
 	}
 }

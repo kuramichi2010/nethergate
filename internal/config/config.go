@@ -39,10 +39,14 @@ type LogSource struct {
 }
 
 type Policy struct {
-	DryRun           bool     `json:"dry_run"`
-	DefaultTTL       Duration `json:"default_ttl"`
-	MaxTTL           Duration `json:"max_ttl"`
-	MaxBlocksPerHour int      `json:"max_blocks_per_hour"`
+	DryRun     bool     `json:"dry_run"`
+	DefaultTTL Duration `json:"default_ttl"`
+	MaxTTL     Duration `json:"max_ttl"`
+	// Global cap on automated blocks (rules + playbook + ai) per hour.
+	MaxBlocksPerHour int `json:"max_blocks_per_hour"`
+	// Per-actor caps per hour, so a misbehaving AI cannot use up the
+	// budget the rule engine needs (and vice versa). Humans are not capped.
+	QuotaPerHour map[string]int `json:"quota_per_hour"`
 	// Rule engine blocks automatically at or above this score (0 disables).
 	AutoBlockScore int `json:"auto_block_score"`
 	// The AI may only block IPs whose incident score is at least this.
@@ -75,6 +79,20 @@ type Playbook struct {
 	MaxMatchIPs int `json:"max_match_ips"`
 }
 
+type EnforcerClients struct {
+	WatchUIDs []int `json:"watch_uids"` // actor "rules" / "playbook"
+	MCPUIDs   []int `json:"mcp_uids"`   // actor "ai"
+	AdminUIDs []int `json:"admin_uids"` // actor "human" (root always is)
+}
+
+// AuditAnchor publishes the audit chain heads (record count + hash) outside
+// the host, so truncating or rewriting a log is detectable later.
+type AuditAnchor struct {
+	Interval Duration `json:"interval"`
+	// Optional HTTPS endpoint that receives {"file","n","hash","time"} JSON.
+	URL string `json:"url"`
+}
+
 type Notify struct {
 	// Slack/Discord-compatible incoming webhook URL (optional).
 	WebhookURL string `json:"webhook_url"`
@@ -88,16 +106,18 @@ type Config struct {
 	EnforcerStateDir string `json:"enforcer_state_dir"`
 	ReportDir        string `json:"report_dir"`
 	EnforcerSocket   string `json:"enforcer_socket"`
-	// UIDs allowed to talk to the enforcer socket.
-	EnforcerClientUIDs []int    `json:"enforcer_client_uids"`
-	Allowlist          []string `json:"allowlist"`
-	Window             Duration `json:"window"`
-	MaxScanBytes       int64    `json:"max_scan_bytes"`
-	Policy             Policy   `json:"policy"`
-	OSINT              OSINT    `json:"osint"`
-	Triage             Triage   `json:"triage"`
-	Notify             Notify   `json:"notify"`
-	Playbook           Playbook `json:"playbook"`
+	// Which UIDs may talk to the enforcer, by role. The enforcer derives the
+	// actor from the caller's UID; requests cannot claim to be someone else.
+	EnforcerClients EnforcerClients `json:"enforcer_clients"`
+	AuditAnchor     AuditAnchor     `json:"audit_anchor"`
+	Allowlist       []string        `json:"allowlist"`
+	Window          Duration        `json:"window"`
+	MaxScanBytes    int64           `json:"max_scan_bytes"`
+	Policy          Policy          `json:"policy"`
+	OSINT           OSINT           `json:"osint"`
+	Triage          Triage          `json:"triage"`
+	Notify          Notify          `json:"notify"`
+	Playbook        Playbook        `json:"playbook"`
 
 	AllowPrefixes []netip.Prefix `json:"-"`
 }
@@ -123,12 +143,14 @@ func Default() *Config {
 		ReportDir:        "/var/lib/nethergate/reports",
 		EnforcerSocket:   "/run/nethergate/enforcer.sock",
 		Window:           Duration(24 * time.Hour),
+		AuditAnchor:      AuditAnchor{Interval: Duration(5 * time.Minute)},
 		MaxScanBytes:     64 << 20,
 		Policy: Policy{
 			DryRun:           true,
 			DefaultTTL:       Duration(time.Hour),
 			MaxTTL:           Duration(24 * time.Hour),
 			MaxBlocksPerHour: 60,
+			QuotaPerHour:     map[string]int{"ai": 20, "rules": 60, "playbook": 60},
 			AutoBlockScore:   90,
 			AIMinScore:       30,
 		},
@@ -170,6 +192,36 @@ func (c *Config) Validate() error {
 	}
 	if c.Policy.MaxBlocksPerHour <= 0 {
 		errs = append(errs, errors.New("policy: max_blocks_per_hour must be > 0"))
+	}
+	for _, a := range []string{"ai", "rules", "playbook"} {
+		if c.Policy.QuotaPerHour[a] <= 0 {
+			errs = append(errs, fmt.Errorf("policy: quota_per_hour.%s must be > 0", a))
+		}
+	}
+	for a := range c.Policy.QuotaPerHour {
+		if a != "ai" && a != "rules" && a != "playbook" {
+			errs = append(errs, fmt.Errorf("policy: quota_per_hour: unknown actor %q", a))
+		}
+	}
+	roles := map[int]string{}
+	for role, uids := range map[string][]int{"watch": c.EnforcerClients.WatchUIDs, "mcp": c.EnforcerClients.MCPUIDs, "admin": c.EnforcerClients.AdminUIDs} {
+		for _, u := range uids {
+			if prev, ok := roles[u]; ok && prev != role {
+				errs = append(errs, fmt.Errorf("enforcer_clients: uid %d has two roles (%s, %s); give each process its own user", u, prev, role))
+			}
+			if u == 0 && role != "admin" {
+				errs = append(errs, errors.New("enforcer_clients: uid 0 is always admin"))
+			}
+			roles[u] = role
+		}
+	}
+	if c.AuditAnchor.Interval <= 0 {
+		errs = append(errs, errors.New("audit_anchor.interval must be > 0"))
+	}
+	if c.AuditAnchor.URL != "" {
+		if u, err := url.Parse(c.AuditAnchor.URL); err != nil || u.Scheme != "https" || u.Host == "" {
+			errs = append(errs, errors.New("audit_anchor.url must be an https:// URL"))
+		}
 	}
 	if c.Window <= 0 {
 		errs = append(errs, errors.New("window must be > 0"))

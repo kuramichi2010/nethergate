@@ -14,15 +14,16 @@ AIがどう判断しても、ポリシーを超える操作は物理的にでき
                               │ SSH（鍵は "nethergate mcp" しか起動できない）
 ════════════════ 防御対象サーバー ═══════════════╪═══════════════════════
                               ▼
-  ┌──────────────────────── ng-agent（権限なし）──────────────────────┐
-  │ nethergate mcp   … AI用の7つのツールのみ。ログは無害化して渡す       │
-  │ nethergate watch … ログ監視 → ルールで即ブロック / AIに調査依頼 / 通知 │
-  └──────────────┬─────────────────────────────────────────────────────┘
-                 │ Unixソケット（接続元UIDを確認）
-  ┌──────────────▼──── ng-enforcer（CAP_NET_ADMIN だけ）─────────────────┐
-  │ nethergate enforcer … ポリシーで検査 → nftables のセットに単一IPを時限追加 │
-  └───────────────────────────────────────────────────────────────────┘
-  すべての判断・操作 → ハッシュチェーン付きの監査ログ（改ざんは検出できる）
+  ┌── ng-mcp（権限なし）──────────────┐  ┌── ng-watch（権限なし）──────────────┐
+  │ nethergate mcp … AI用ツールのみ    │  │ nethergate watch … ログ監視 →        │
+  │ ログは無害化して渡す               │  │ ルール/記録書で即ブロック・AIに調査依頼 │
+  └───────────────┬────────────────────┘  └──────────────┬──────────────────────┘
+                  │ Unixソケット：送り手は接続元UIDで決まる（ai / rules・playbook / human）
+  ┌───────────────▼──── ng-enforcer（CAP_NET_ADMIN だけ）─────────────────────┐
+  │ nethergate enforcer … ログから自分でインシデントを再計算 → ポリシー・上限で検査 │
+  │ → 監査ログに先に記録（書けなければ中止）→ nftables に単一IPを時限追加         │
+  └──────────────────────────────────────────────────────────────────────┘
+  すべての判断・操作 → ハッシュチェーン付きの監査ログ → 件数とハッシュを定期的に外部へ（アンカー）
 ```
 
 ## AIができること / できないこと
@@ -47,7 +48,8 @@ AIがどう判断しても、ポリシーを超える操作は物理的にでき
 | **プロンプトインジェクション**（User-Agentやパスに「指示を無視して〜」を仕込む） | 制御文字やbidi文字を除去し、秘密情報をマスクし、160文字で切り詰める。`untrusted_*` ラベルを付けて渡す。調査依頼のプロンプトには自分たちが生成した値（IPとスコア）しか入れない |
 | **AIをだましてサービスを止めさせる**（顧客やCDNのIPをブロックさせる） | このサーバーに攻撃したIPしか対象にしない。許可リスト、単一IPのみ、TTL上限、件数上限で縛る。ポリシーは特権側のプロセスで再検査する |
 | **nethergate自体の乗っ取り** | 権限を分離（ファイアウォールを触るのは小さなenforcerだけ）。外部依存は0（Go標準ライブラリのみ）。待ち受けるネットワークポートなし。systemdで厳しくサンドボックス化。nftはシェルを経由せず引数で実行 |
-| **痕跡の消去** | 監査ログはハッシュチェーンで、`nethergate verify` で改ざんや削除を検出できる。enforcerの監査ログとブロック状態は別ディレクトリ（`/var/lib/nethergate-enforcer`、ng-enforcer所有）にあり、agentからは書き換えも削除もできない |
+| **MCPやwatchが乗っ取られ、enforcerに直接リクエストを送る** | enforcerは呼び出し側を信用しない。① 送り手（ai / rules / playbook / human）は**接続元のUID**から決める（リクエストで名乗れない）② 自動のブロックは、enforcer自身がログを読み直してインシデントを再計算し、条件（AIは `ai_min_score`、ルールは `auto_block_score`、記録書は承認済みルールの発動）を満たすときだけ実行する。ログを読めなければ拒否する ③ AIが解除できるのは**AI自身がかけたブロックだけ**。延長しても所有者は強いほう（human > playbook > rules > ai）のまま ④ 件数上限は送り手ごと（初期値：ai 20 / rules 60 / playbook 60 件/時）なので、AIが上限を使い切ってもルールエンジンは止まらない。人間（ユーザー）の操作は上限の対象外 ⑤ `mcp` や `watch` を別の役割のUID（rootなど）で起動しようとすると、起動を拒否する |
+| **痕跡の消去** | 監査ログはハッシュチェーンで、`nethergate verify` で改ざんを検出できる。enforcerは**監査ログに書けなければファイアウォールを変更しない**（先に「これから実行する」記録を書く）。ログの末尾を丸ごと消されるとチェーンだけでは検出できないため、各ログの「件数とハッシュ」を `NETHERGATE-ANCHOR` 行として journald へ定期的に出し、必要なら `audit_anchor.url` へも送る（**外部アンカー**）。journald を別のサーバー（syslog/SIEM）に転送しておけば、`journalctl -u 'nethergate-*' > anchors.txt` → `nethergate verify -anchors anchors.txt` で、末尾の削除や作り直しも検出できる |
 | **大量のログでの攻撃** | 読み込む量の上限、1行の長さの上限、保持するサンプル数の上限、調査は同時に1件まで（クールダウンあり） |
 
 ## 判断の流れ（タイミングの判断）
@@ -117,16 +119,19 @@ sudo nethergate playbook remove <id>   # 承認済みルールを無効にする
 go build -trimpath -ldflags=-s -o nethergate ./cmd/nethergate
 sudo install -m 0755 nethergate /usr/local/bin/
 sudo install -D -m 0644 deploy/sysusers-nethergate.conf /etc/sysusers.d/nethergate.conf && sudo systemd-sysusers
-#   SSH経由でAIをつなぐ場合：ng-agent のホームと authorized_keys を用意する（鍵ファイルは root 所有）
-sudo install -d -m 0750 -o ng-agent -g nethergate /home/ng-agent && sudo install -d -m 0755 /home/ng-agent/.ssh
+#   AIはSSHで ng-mcp としてつなぐ：ホームと authorized_keys を用意する（鍵ファイルは root 所有）
+sudo install -d -m 0750 -o ng-mcp -g nethergate /home/ng-mcp && sudo install -d -m 0755 /home/ng-mcp/.ssh
 sudo install -D -m 0640 -g nethergate deploy/config.example.json /etc/nethergate/config.json
 echo '[]' | sudo install -m 0644 /dev/stdin /etc/nethergate/playbook.json   # 承認済みの記録書（root所有）
 echo '[]' | sudo install -m 0644 /dev/stdin /etc/nethergate/lessons.json    # ユーザーの判断の記録（root所有）
-#   → config.json の enforcer_client_uids に `id -u ng-agent` の値を入れる。allowlist に管理元のIPを入れる
+#   → config.json の enforcer_clients に各UIDを入れる（役割ごとに必ず別のユーザー）：
+#        "watch_uids": [`id -u ng-watch`], "mcp_uids": [`id -u ng-mcp`], "admin_uids": []（rootは常に管理者）
+#     allowlist に管理元のIPを入れる
 nethergate nft-setup | sudo tee /etc/nftables.d/nethergate.nft && sudo nft -f /etc/nftables.d/nethergate.nft
 sudo install -m 0644 deploy/nethergate-*.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer nethergate-watch
-#   ↑ watch を先に一度起動しておくと /var/lib/nethergate が ng-agent 所有で作られ、SSH経由の mcp も監査ログを書ける
+#   ↑ watch を先に一度起動しておくと /var/lib/nethergate が作られ（1770, group nethergate）、SSH経由の mcp も監査ログを書ける
+#   外部アンカー：journald をリモートの syslog/SIEM へ転送する（推奨）か、config の audit_anchor.url に収集先を設定する
 ```
 
 最初は `"dry_run": true` のまま数日動かし、`nethergate scan` と監査ログで誤検知がないかを確認してください。問題なければ `false` にします。
@@ -138,6 +143,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer 
   - Claude Code：`deploy/claude-mcp.ssh.example.json` を `--mcp-config` で読み込む
   - Codex：`deploy/codex-config.example.toml`
 - 自動で調査させる場合は、`deploy/triage-command.example.json` の内容を config の `triage.command` に入れます（nethergateのツール以外は使えないようにしてあります）
+  - 同じサーバー上で調査させる場合も、MCPサーバーは必ず **ng-mcp** として動かします（`deploy/claude-mcp.local.example.json`：localhost へのSSHでユーザーを切り替える）。watch のユーザーのまま `nethergate mcp` を起動しようとすると、起動を拒否します
 
 ## サーバー構成のアドバイス
 

@@ -12,9 +12,9 @@ import (
 	"github.com/kuramichi2010/nethergate/internal/audit"
 	"github.com/kuramichi2010/nethergate/internal/config"
 	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/logscan"
 	"github.com/kuramichi2010/nethergate/internal/mcp"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
-	"github.com/kuramichi2010/nethergate/internal/watch"
 )
 
 const playbookUsage = `usage: nethergate playbook list
@@ -80,7 +80,7 @@ func runPlaybook(cfg *config.Config, args []string) error {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(r)
-		scan := func(rules []*playbook.Rule) (*detect.Analyzer, error) { return watch.Scan(cfg, rules, time.Now()) }
+		scan := func(rules []*playbook.Rule) (*detect.Analyzer, error) { return logscan.Scan(cfg, rules, time.Now()) }
 		rep, _, err := mcp.ReplayRule(scan, others, r, cfg.Window.D())
 		if err != nil {
 			return fmt.Errorf("replay: %w", err)
