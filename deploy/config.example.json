@@ -18,6 +18,21 @@
     "max_ttl": "24h",
     "max_blocks_per_hour": 60,
     "quota_per_hour": { "ai": 20, "rules": 60, "playbook": 60 },
+    "ai": {
+      "mode": "act",
+      "max_ttl": "6h",
+      "quarantine_rejections": 5,
+      "quarantine_window": "10m",
+      "shared_min_ok_requests": 50,
+      "shared_min_user_agents": 10,
+      "enrich_per_hour": 120,
+      "reviews_per_hour": 30,
+      "proposals_per_day": 20,
+      "reports_per_day": 50,
+      "report_dir_max_mb": 100,
+      "max_allow_prefix_v4": 24,
+      "max_allow_prefix_v6": 48
+    },
     "auto_block_score": 90,
     "ai_min_score": 30
   },

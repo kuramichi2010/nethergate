@@ -18,6 +18,11 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: "The enforcer is not answering: no blocks can be placed or lifted."
+      - alert: NethergateAIPaused
+        expr: nethergate_enforcer_ai_paused == 1
+        labels: {severity: warning}
+        annotations:
+          summary: "AI actions are paused (quarantine or human). Check the audit log for injected instructions, then `nethergate ai resume -reason ...`."
       - alert: NethergateAIRefusalSpike
         expr: sum(increase(nethergate_enforcer_requests_total{actor="ai",result="rejected"}[15m])) > 10
         labels: {severity: warning}

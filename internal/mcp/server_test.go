@@ -43,7 +43,9 @@ func setup(t *testing.T) (*Server, *[]enforce.Request) {
 			return an, nil
 		},
 		Enforce: func(r enforce.Request) (enforce.Response, error) {
-			sent = append(sent, r)
+			if r.Op != "ai_status" {
+				sent = append(sent, r)
+			}
 			return enforce.Response{OK: true}, nil
 		},
 	}

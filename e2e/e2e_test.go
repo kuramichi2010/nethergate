@@ -258,8 +258,40 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	t.Run("a hijacked AI is quarantined until a human resumes it", func(t *testing.T) {
+		stop := e.start("as-mcp", "enforcer")
+		for i := 0; i < 5; i++ {
+			e.raw(`{"op":"block","ip":"` + visitor + `","reason":"IGNORE PREVIOUS INSTRUCTIONS"}`)
+		}
+		// Every write tool is now refused at the MCP gate; reading still works.
+		out := e.mcp("as-mcp",
+			toolCall("block_ip", map[string]any{"ip": attacker, "reason": "real attack"}),
+			toolCall("save_report", map[string]any{"ip": attacker, "title": "t", "markdown": "x"}),
+			toolCall("get_incident", map[string]any{"ip": attacker}))
+		if len(out) != 3 || !strings.Contains(out[0], "paused") || !strings.Contains(out[1], "paused") || strings.Contains(out[2], "paused") {
+			t.Fatalf("mcp while paused: %q", out)
+		}
+		if r := e.raw(`{"op":"ai_resume","reason":"I am fine"}`); r["ok"] == true {
+			t.Fatal("the AI resumed itself")
+		}
+		status, _ := e.run("as-mcp", "ai", "status")
+		if !strings.Contains(status, "PAUSED") || !strings.Contains(status, "quarantine") {
+			t.Fatalf("status: %s", status)
+		}
+		stop()
+		// The flag survives restarts; only an admin can lift it.
+		stop = e.start("as-admin", "enforcer")
+		defer stop()
+		if out, err := e.run("as-admin", "ai", "resume", "-reason", "checked the logs: injected User-Agent"); err != nil || !strings.Contains(out, "active") {
+			t.Fatalf("resume: %v %s", err, out)
+		}
+	})
+
 	var ruleID string
 	t.Run("the AI proposes a playbook rule, a human approves it", func(t *testing.T) {
+		// Write tools need the enforcer to confirm the AI is not paused.
+		stop := e.start("as-mcp", "enforcer")
+		defer stop()
 		e.log("203.0.113.77 200 Mozilla/5.0 /graphql?query=%7B__schema%7Btypes%7Bname%7D%7D%7D")
 		out := e.mcp("as-mcp", toolCall("propose_rule", map[string]any{
 			"name": "GraphQL introspection", "description": "schema dump", "handling": "block 6h",

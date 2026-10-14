@@ -55,14 +55,14 @@ const nftRuleset = `table inet nethergate {
 `
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: nethergate [-config path] enforcer|watch|mcp|scan|verify|nft-setup|playbook ...|review ...|correct ...")
+	fmt.Fprintln(os.Stderr, "usage: nethergate [-config path] enforcer|watch|mcp|scan|verify|nft-setup|playbook ...|review ...|correct ...|ai status|pause|resume")
 	os.Exit(2)
 }
 
 func main() {
 	cfgPath := flag.String("config", "/etc/nethergate/config.json", "config file")
 	flag.Parse()
-	multi := map[string]bool{"playbook": true, "review": true, "correct": true, "verify": true}
+	multi := map[string]bool{"playbook": true, "review": true, "correct": true, "verify": true, "ai": true}
 	if flag.NArg() < 1 || (flag.NArg() > 1 && !multi[flag.Arg(0)]) {
 		usage()
 	}
@@ -117,6 +117,7 @@ func main() {
 			}
 		}()
 		srv.StatePath = filepath.Join(cfg.EnforcerStateDir, "blocks.json")
+		srv.AIStatePath = filepath.Join(cfg.EnforcerStateDir, "ai-state.json")
 		srv.PlaybookPath = cfg.Playbook.Path
 		if err := srv.LoadState(); err != nil {
 			log.Printf("restore blocks: %v", err)
@@ -168,6 +169,11 @@ func main() {
 		}
 	case "review":
 		if err := runReview(cfg, flag.Args()[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "ai":
+		if err := runAI(cfg, flag.Args()[1:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

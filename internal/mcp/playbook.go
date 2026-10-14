@@ -51,7 +51,7 @@ func (s *Server) playbookTools() []tool {
 
 func (s *Server) listPlaybook(ctx context.Context, _ json.RawMessage) (any, error) {
 	pending, errs := playbook.Load(s.Cfg.ProposalsPath())
-	out := map[string]any{"approved": nonNil(s.Rules), "pending_approval": nonNil(pending)}
+	out := map[string]any{"approved_by_human": nonNil(s.Rules), "pending_approval": pendingView(pending), "note": untrustedAINote}
 	if len(errs) > 0 {
 		out["pending_errors"] = len(errs)
 	}
@@ -179,6 +179,13 @@ func (s *Server) proposeRule(ctx context.Context, raw json.RawMessage) (any, err
 	if err := r.Compile(); err != nil {
 		return nil, err
 	}
+	// A hijacked AI could try to talk a human into approving a wide exemption.
+	for _, pf := range r.Prefixes() {
+		g := s.Cfg.Policy.AI
+		if (pf.Addr().Is4() && pf.Bits() < g.MaxAllowPrefixV4) || (pf.Addr().Is6() && pf.Bits() < g.MaxAllowPrefixV6) {
+			return nil, fmt.Errorf("the AI may propose allow ranges no wider than /%d (IPv4) or /%d (IPv6); a human can add wider ones with `nethergate correct`", g.MaxAllowPrefixV4, g.MaxAllowPrefixV6)
+		}
+	}
 	if err := r.CheckBenign(); err != nil {
 		return nil, err
 	}
@@ -253,7 +260,17 @@ func (s *Server) requestReview(ctx context.Context, raw json.RawMessage) (any, e
 	}
 	rv := playbook.Review{ID: playbook.NewID(), CreatedAt: time.Now().UTC(), IP: ip.String(), Score: inc.Score,
 		Question: cleanText(p.Question), Considered: cleanText(p.Considered), Leaning: p.Leaning, Interim: cleanText(p.Interim)}
-	err = playbook.UpdateList(s.Cfg.ReviewsPath(), 0o660, func(list []playbook.Review) ([]playbook.Review, error) {
+	id, err := s.queueReview(rv)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"review_id": id, "status": "queued for a human; the administrators are notified",
+		"human_command": "nethergate review answer " + id + " malicious|benign -note \"...\""}, nil
+}
+
+// queueReview stores rv (one open review per IP) and returns its id.
+func (s *Server) queueReview(rv playbook.Review) (string, error) {
+	err := playbook.UpdateList(s.Cfg.ReviewsPath(), 0o660, func(list []playbook.Review) ([]playbook.Review, error) {
 		for i, o := range list {
 			if o.IP == rv.IP { // one open question per IP: refresh it
 				rv.ID = o.ID
@@ -266,9 +283,5 @@ func (s *Server) requestReview(ctx context.Context, raw json.RawMessage) (any, e
 		}
 		return append(list, rv), nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{"review_id": rv.ID, "status": "queued for a human; the administrators are notified",
-		"human_command": "nethergate review answer " + rv.ID + " malicious|benign -note \"...\""}, nil
+	return rv.ID, err
 }

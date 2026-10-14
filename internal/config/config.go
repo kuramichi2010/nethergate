@@ -52,7 +52,39 @@ type Policy struct {
 	AutoBlockScore int `json:"auto_block_score"`
 	// The AI may only block IPs whose incident score is at least this.
 	AIMinScore int `json:"ai_min_score"`
+	// Limits that assume the AI may be hijacked by prompt injection.
+	AI AIGuard `json:"ai"`
 }
+
+// AIGuard bounds what a prompt-injected AI can do.
+type AIGuard struct {
+	// "act" (default): the AI may place short blocks itself.
+	// "advise": the AI can only recommend; its block requests become
+	// reviews that a human approves. The enforcer refuses AI blocks.
+	Mode string `json:"mode"`
+	// Longest block the AI may place (shorter than max_ttl).
+	MaxTTL Duration `json:"max_ttl"`
+	// Quarantine: after this many refused AI requests within the window,
+	// the enforcer stops accepting any AI action until a human resumes it.
+	QuarantineRejections int      `json:"quarantine_rejections"`
+	QuarantineWindow     Duration `json:"quarantine_window"`
+	// A source with this many successful requests or distinct user agents
+	// looks shared (NAT, proxy, office): the AI may not block it alone.
+	SharedMinOK  int `json:"shared_min_ok_requests"`
+	SharedMinUAs int `json:"shared_min_user_agents"`
+	// Per-tool limits across MCP sessions (calls per hour; reports per day).
+	EnrichPerHour   int `json:"enrich_per_hour"`
+	ReviewsPerHour  int `json:"reviews_per_hour"`
+	ProposalsPerDay int `json:"proposals_per_day"`
+	ReportsPerDay   int `json:"reports_per_day"`
+	ReportDirMaxMB  int `json:"report_dir_max_mb"`
+	// Widest allow range the AI may propose (humans are not limited).
+	MaxAllowPrefixV4 int `json:"max_allow_prefix_v4"`
+	MaxAllowPrefixV6 int `json:"max_allow_prefix_v6"`
+}
+
+// AIAdvisory reports whether the AI may only recommend blocks.
+func (p Policy) AIAdvisory() bool { return p.AI.Mode == "advise" }
 
 type OSINT struct {
 	Enabled bool `json:"enabled"`
@@ -184,8 +216,15 @@ func Default() *Config {
 			MaxTTL:           Duration(24 * time.Hour),
 			MaxBlocksPerHour: 60,
 			QuotaPerHour:     map[string]int{"ai": 20, "rules": 60, "playbook": 60},
-			AutoBlockScore:   90,
-			AIMinScore:       30,
+			AI: AIGuard{
+				Mode: "act", MaxTTL: Duration(6 * time.Hour),
+				QuarantineRejections: 5, QuarantineWindow: Duration(10 * time.Minute),
+				SharedMinOK: 50, SharedMinUAs: 10,
+				EnrichPerHour: 120, ReviewsPerHour: 30, ProposalsPerDay: 20, ReportsPerDay: 50, ReportDirMaxMB: 100,
+				MaxAllowPrefixV4: 24, MaxAllowPrefixV6: 48,
+			},
+			AutoBlockScore: 90,
+			AIMinScore:     30,
 		},
 		OSINT:    OSINT{Enabled: true},
 		Playbook: Playbook{Path: "/etc/nethergate/playbook.json", LessonsPath: "/etc/nethergate/lessons.json", MaxMatchIPs: 200},
@@ -222,6 +261,28 @@ func (c *Config) Validate() error {
 	}
 	if c.Policy.MaxTTL <= 0 || c.Policy.DefaultTTL <= 0 || c.Policy.DefaultTTL > c.Policy.MaxTTL {
 		errs = append(errs, errors.New("policy: need 0 < default_ttl <= max_ttl"))
+	}
+	{
+		g := c.Policy.AI
+		if g.Mode != "act" && g.Mode != "advise" {
+			errs = append(errs, errors.New(`policy.ai.mode must be "act" or "advise"`))
+		}
+		if g.MaxTTL <= 0 || g.MaxTTL > c.Policy.MaxTTL {
+			errs = append(errs, errors.New("policy.ai.max_ttl must be > 0 and <= policy.max_ttl"))
+		}
+		if g.QuarantineRejections <= 0 || g.QuarantineWindow <= 0 {
+			errs = append(errs, errors.New("policy.ai.quarantine_rejections and quarantine_window must be > 0"))
+		}
+		for name, v := range map[string]int{"shared_min_ok_requests": g.SharedMinOK, "shared_min_user_agents": g.SharedMinUAs,
+			"enrich_per_hour": g.EnrichPerHour, "reviews_per_hour": g.ReviewsPerHour, "proposals_per_day": g.ProposalsPerDay,
+			"reports_per_day": g.ReportsPerDay, "report_dir_max_mb": g.ReportDirMaxMB} {
+			if v <= 0 {
+				errs = append(errs, fmt.Errorf("policy.ai.%s must be > 0", name))
+			}
+		}
+		if g.MaxAllowPrefixV4 < 8 || g.MaxAllowPrefixV4 > 32 || g.MaxAllowPrefixV6 < 16 || g.MaxAllowPrefixV6 > 128 {
+			errs = append(errs, errors.New("policy.ai.max_allow_prefix_v4 must be 8..32 and max_allow_prefix_v6 16..128"))
+		}
 	}
 	if c.Policy.MaxBlocksPerHour <= 0 {
 		errs = append(errs, errors.New("policy: max_blocks_per_hour must be > 0"))

@@ -82,6 +82,12 @@ type PlaybookMatch struct {
 	Rule *playbook.Rule `json:"-"`
 }
 
+// OKRequests counts HTTP requests that did not fail (2xx/3xx).
+func (inc *Incident) OKRequests() int { return inc.Requests - inc.Errors4xx - inc.Errors5xx }
+
+// DistinctUAs counts the user agents seen from this source (capped at 256).
+func (inc *Incident) DistinctUAs() int { return len(inc.uas) }
+
 // Hits reports how many events from this source matched r (malicious or
 // allow rule) and whether that reached the rule's min_hits.
 func (inc *Incident) Hits(r *playbook.Rule) (int, bool) {

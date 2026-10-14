@@ -87,6 +87,8 @@ type Response struct {
 	// "metrics": Prometheus text, re-exported by the watch daemon (the
 	// enforcer itself has no network access).
 	Metrics string `json:"metrics,omitempty"`
+	// "ai_status" / "ai_pause" / "ai_resume".
+	AI *AIState `json:"ai,omitempty"`
 }
 
 type Server struct {
@@ -102,7 +104,11 @@ type Server struct {
 	// OnAudit is called after records are appended (e.g. to publish the
 	// chain head as an external anchor).
 	OnAudit func()
-	metrics *metrics.Registry
+	// AIStatePath persists the AI pause/quarantine flag across restarts.
+	AIStatePath string
+	metrics     *metrics.Registry
+	ai          AIState
+	aiRejects   []time.Time
 	// StatePath persists active blocks so a restarted enforcer can still
 	// list and unblock them (and re-installs them after a reboot).
 	StatePath string
@@ -124,6 +130,8 @@ func NewServer(p *policy.Engine, a *audit.Log, clients config.EnforcerClients, t
 	m.Describe("nethergate_enforcer_quota_remaining", metrics.Gauge, "Blocks each automated actor may still place this hour.")
 	m.Describe("nethergate_enforcer_audit_records", metrics.Gauge, "Records in the enforcer audit chain.")
 	m.Describe("nethergate_enforcer_dry_run", metrics.Gauge, "1 if the enforcer does not touch the firewall.")
+	m.Describe("nethergate_enforcer_ai_paused", metrics.Gauge, "1 while AI actions are paused (quarantine or human).")
+	m.Describe("nethergate_enforcer_ai_pauses_total", metrics.Counter, "Times AI actions were paused, by who paused them (quarantine|human).")
 	return &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}, metrics: m}
 }
 
@@ -148,6 +156,11 @@ func (s *Server) metricsText() string {
 		dry = 1
 	}
 	m.Set("nethergate_enforcer_dry_run", dry)
+	paused := 0.0
+	if s.ai.Paused {
+		paused = 1
+	}
+	m.Set("nethergate_enforcer_ai_paused", paused)
 	return m.Text()
 }
 
@@ -203,6 +216,7 @@ func peerUID(c *net.UnixConn) (int, error) {
 // LoadState restores blocks saved by a previous run and re-adds the ones
 // that have not expired (a no-op if they are still in the kernel set).
 func (s *Server) LoadState() error {
+	s.loadAIState()
 	if s.StatePath == "" {
 		return nil
 	}
@@ -313,7 +327,10 @@ func (s *Server) handle(c *net.UnixConn) {
 // Do executes one request from a caller with the given role.
 func (s *Server) Do(role Role, req Request) Response {
 	resp, actor := s.do(role, req)
-	if req.Op != "list" && req.Op != "metrics" {
+	if actor == "ai" && !resp.OK && (req.Op == "block" || req.Op == "unblock") && !strings.HasPrefix(resp.Error, errAIPaused.Error()) {
+		s.noteAIRejection(resp.Error)
+	}
+	if req.Op != "list" && req.Op != "metrics" && !strings.HasPrefix(req.Op, "ai_") {
 		result := "ok"
 		switch {
 		case resp.OK:
@@ -379,6 +396,24 @@ func (s *Server) do(role Role, req Request) (Response, string) {
 		}
 		return Response{OK: true, Metrics: s.metricsText()}, actor
 	}
+	switch req.Op {
+	case "ai_status":
+		return Response{OK: true, AI: s.aiState()}, actor
+	case "ai_pause", "ai_resume":
+		if role != RoleAdmin {
+			return Response{Error: "permission denied"}, actor
+		}
+		if req.Op == "ai_pause" {
+			s.pauseAI("human", req.Reason)
+		} else if err := s.resumeAI(req.Reason); err != nil {
+			return Response{Error: err.Error()}, actor
+		}
+		return Response{OK: true, AI: s.aiState()}, actor
+	}
+	if actor == "ai" && s.ai.Paused {
+		_ = s.Audit.Write(actor, req.Op, req, "rejected: AI paused")
+		return Response{Error: fmt.Sprintf("%v since %s (%s): %s", errAIPaused, s.ai.Since.Format(time.RFC3339), s.ai.By, s.ai.Reason)}, actor
+	}
 	reject := func(err error) Response {
 		_ = s.Audit.Write(actor, req.Op, req, "rejected: "+err.Error())
 		return Response{Error: err.Error()}
@@ -403,6 +438,9 @@ func (s *Server) do(role Role, req Request) (Response, string) {
 	}
 	if ruleTTL > 0 {
 		ttl = min(ttl, ruleTTL)
+	}
+	if actor == "ai" {
+		ttl = min(ttl, s.Thresholds.AI.MaxTTL.D())
 	}
 	key := ip.String()
 	detail := map[string]any{"ip": key, "ttl": ttl.String(), "reason": req.Reason, "rule_id": req.RuleID}
@@ -471,6 +509,8 @@ func (s *Server) do(role Role, req Request) (Response, string) {
 	return Response{OK: true, DryRun: s.DryRun}, actor
 }
 
+var errAIPaused = errors.New("AI actions are paused")
+
 // authorize re-derives the incident behind an automated block. It returns
 // the TTL cap from the playbook rule, if one was used.
 func (s *Server) authorize(actor string, req Request) (time.Duration, error) {
@@ -491,8 +531,16 @@ func (s *Server) authorize(actor string, req Request) (time.Duration, error) {
 	t := s.Thresholds
 	switch actor {
 	case "ai":
+		if t.AIAdvisory() {
+			return 0, errors.New("policy.ai.mode is advise: the AI may only recommend blocks (request_human_review)")
+		}
 		if inc.Score < t.AIMinScore {
 			return 0, fmt.Errorf("incident score %d for %s is below ai_min_score %d", inc.Score, ip, t.AIMinScore)
+		}
+		// An attacker behind a shared address (office NAT, mobile carrier,
+		// proxy) could steer the AI into blocking everyone behind it.
+		if ok, uas := inc.OKRequests(), inc.DistinctUAs(); ok >= t.AI.SharedMinOK || uas >= t.AI.SharedMinUAs {
+			return 0, fmt.Errorf("%s looks shared (%d successful requests, %d user agents): legitimate users may sit behind it; ask a human", ip, ok, uas)
 		}
 	case "rules":
 		if t.AutoBlockScore <= 0 || inc.Score < t.AutoBlockScore {

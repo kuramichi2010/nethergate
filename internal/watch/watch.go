@@ -45,6 +45,21 @@ type Daemon struct {
 
 	metrics   *metrics.Registry
 	forwarder *forward.Forwarder
+	aiPaused  bool
+}
+
+// checkAI follows the enforcer's AI pause flag: humans hear about a
+// quarantine at once, and no triage is started while the AI is paused.
+func (d *Daemon) checkAI() {
+	resp, err := enforce.Call(d.Cfg.EnforcerSocket, enforce.Request{Op: "ai_status"})
+	if err != nil || resp.AI == nil {
+		return
+	}
+	if resp.AI.Paused && !d.aiPaused {
+		d.send(fmt.Sprintf("[nethergate] AI actions PAUSED (%s): %s -> investigate, then `nethergate ai resume -reason ...`",
+			resp.AI.By, sanitize.Untrusted(resp.AI.Reason)))
+	}
+	d.aiPaused = resp.AI.Paused
 }
 
 func fileStamp(path string) string {
@@ -108,6 +123,7 @@ func (d *Daemon) step(ctx context.Context, now time.Time) {
 		d.analyzer.Rules = d.loadRules()
 	}
 	d.announceReviews()
+	d.checkAI()
 	for _, t := range d.tailers {
 		if err := t.poll(d.analyzer, now); err != nil {
 			log.Printf("tail %s: %v", t.src.Path, err)
@@ -170,7 +186,7 @@ func (d *Daemon) handle(ctx context.Context, inc *detect.Incident, now time.Time
 	// 3. Ambiguous / important: ask the AI to investigate through MCP.
 	// A known, already-handled pattern does not need the AI again.
 	t := d.Cfg.Triage
-	if handledByPlaybook || len(t.Command) == 0 || inc.Score < t.MinScore {
+	if handledByPlaybook || d.aiPaused || len(t.Command) == 0 || inc.Score < t.MinScore {
 		return
 	}
 	if last, ok := d.triaged[inc.IP]; ok && now.Sub(last) < t.Cooldown.D() {
