@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/event"
-	"github.com/michitaka/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
 var t0 = time.Date(2026, 10, 14, 0, 0, 0, 0, time.UTC)

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/config"
 )
 
 func engine() *Engine {

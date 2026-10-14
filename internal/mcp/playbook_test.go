@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/michitaka/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
 func propose(t *testing.T, s *Server, args map[string]any) (string, bool) {

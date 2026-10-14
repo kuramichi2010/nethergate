@@ -1,3 +1,3 @@
-module github.com/michitaka/nethergate
+module github.com/kuramichi2010/nethergate
 
 go 1.24

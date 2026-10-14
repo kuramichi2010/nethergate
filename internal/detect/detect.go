@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/event"
-	"github.com/michitaka/nethergate/internal/playbook"
-	"github.com/michitaka/nethergate/internal/sanitize"
+	"github.com/kuramichi2010/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/sanitize"
 )
 
 type Signature struct {

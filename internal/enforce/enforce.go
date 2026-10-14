@@ -22,10 +22,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/audit"
-	"github.com/michitaka/nethergate/internal/playbook"
-	"github.com/michitaka/nethergate/internal/policy"
-	"github.com/michitaka/nethergate/internal/sanitize"
+	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/policy"
+	"github.com/kuramichi2010/nethergate/internal/sanitize"
 )
 
 const (

@@ -8,9 +8,9 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/detect"
-	"github.com/michitaka/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
 const maxPending = 100

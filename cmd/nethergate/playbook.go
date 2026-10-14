@@ -9,12 +9,12 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/audit"
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/detect"
-	"github.com/michitaka/nethergate/internal/mcp"
-	"github.com/michitaka/nethergate/internal/playbook"
-	"github.com/michitaka/nethergate/internal/watch"
+	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/mcp"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/watch"
 )
 
 const playbookUsage = `usage: nethergate playbook list

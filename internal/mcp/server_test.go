@@ -10,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/audit"
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/detect"
-	"github.com/michitaka/nethergate/internal/enforce"
-	"github.com/michitaka/nethergate/internal/event"
-	"github.com/michitaka/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
 func setup(t *testing.T) (*Server, *[]enforce.Request) {

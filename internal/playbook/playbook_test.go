@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/michitaka/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/event"
 )
 
 func TestCompileAndMatch(t *testing.T) {

@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/audit"
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/policy"
+	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/policy"
 )
 
 func TestDoBuildsSafeNftArgs(t *testing.T) {

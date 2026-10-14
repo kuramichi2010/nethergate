@@ -9,10 +9,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/detect"
-	"github.com/michitaka/nethergate/internal/event"
-	"github.com/michitaka/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/detect"
+	"github.com/kuramichi2010/nethergate/internal/event"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
 )
 
 // Scan reads the tail (up to MaxScanBytes) of every configured log and

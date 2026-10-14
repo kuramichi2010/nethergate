@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/sanitize"
+	"github.com/kuramichi2010/nethergate/internal/sanitize"
 )
 
 type Result struct {

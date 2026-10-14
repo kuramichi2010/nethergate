@@ -11,12 +11,12 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/michitaka/nethergate/internal/audit"
-	"github.com/michitaka/nethergate/internal/config"
-	"github.com/michitaka/nethergate/internal/enforce"
-	"github.com/michitaka/nethergate/internal/playbook"
-	"github.com/michitaka/nethergate/internal/policy"
-	"github.com/michitaka/nethergate/internal/watch"
+	"github.com/kuramichi2010/nethergate/internal/audit"
+	"github.com/kuramichi2010/nethergate/internal/config"
+	"github.com/kuramichi2010/nethergate/internal/enforce"
+	"github.com/kuramichi2010/nethergate/internal/playbook"
+	"github.com/kuramichi2010/nethergate/internal/policy"
+	"github.com/kuramichi2010/nethergate/internal/watch"
 )
 
 const judgeUsage = `usage: nethergate review list
