@@ -46,3 +46,27 @@ func FuzzParseSSHD(f *testing.F) {
 		ParseSSHD(verb+user, now)
 	})
 }
+
+func FuzzResolveClient(f *testing.F) {
+	f.Add("173.245.48.10", "1.1.1.1, 203.0.113.5")
+	f.Add("198.51.100.7", "203.0.113.5")
+	f.Add("173.245.48.10", "[2001:db8::1]:80,173.245.48.1")
+	cdn := []netip.Prefix{netip.MustParsePrefix("173.245.48.0/20")}
+	f.Fuzz(func(t *testing.T, peer, xff string) {
+		ev, ok := ParseNginxProxy(peer + ` - - [14/Oct/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "a" "` + xff + `"`)
+		if !ok {
+			return
+		}
+		if !ev.ResolveClient(cdn) {
+			return
+		}
+		// The result is never a trusted proxy, and a direct (untrusted)
+		// peer can never be replaced by what it put in the header.
+		if cdn[0].Contains(ev.IP) {
+			t.Fatalf("resolved to the CDN itself: %v", ev.IP)
+		}
+		if !cdn[0].Contains(ev.Peer) && ev.IP != ev.Peer {
+			t.Fatalf("untrusted peer %v replaced by forged header -> %v", ev.Peer, ev.IP)
+		}
+	})
+}

@@ -77,6 +77,8 @@ type Block struct {
 	Expires time.Time `json:"expires"`
 	Reason  string    `json:"reason"`
 	Actor   string    `json:"actor"`
+	// Per-backend handle (e.g. the Cloudflare rule id) needed to remove it.
+	Refs map[string]string `json:"refs,omitempty"`
 }
 
 type Response struct {
@@ -117,8 +119,10 @@ type Server struct {
 	PlaybookPath string
 	pbStamp      string
 	runNft       func(args ...string) error
-	mu           sync.Mutex
-	blocks       map[string]Block
+	// Where blocks are applied; defaults to the local nftables set.
+	Backends []Backend
+	mu       sync.Mutex
+	blocks   map[string]Block
 }
 
 func NewServer(p *policy.Engine, a *audit.Log, clients config.EnforcerClients, thresholds config.Policy, dryRun bool) *Server {
@@ -132,7 +136,10 @@ func NewServer(p *policy.Engine, a *audit.Log, clients config.EnforcerClients, t
 	m.Describe("nethergate_enforcer_dry_run", metrics.Gauge, "1 if the enforcer does not touch the firewall.")
 	m.Describe("nethergate_enforcer_ai_paused", metrics.Gauge, "1 while AI actions are paused (quarantine or human).")
 	m.Describe("nethergate_enforcer_ai_pauses_total", metrics.Counter, "Times AI actions were paused, by who paused them (quarantine|human).")
-	return &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}, metrics: m}
+	m.Describe("nethergate_enforcer_backend_errors_total", metrics.Counter, "Failed operations per enforcement backend (nftables, cloudflare).")
+	s := &Server{Policy: p, Audit: a, Clients: clients, Thresholds: thresholds, DryRun: dryRun, runNft: nft, blocks: map[string]Block{}, metrics: m}
+	s.Backends = []Backend{nftBackend{s}}
+	return s
 }
 
 // metricsText refreshes the gauges and renders all enforcer metrics.
@@ -236,14 +243,28 @@ func (s *Server) LoadState() error {
 	now := time.Now()
 	for _, bl := range list {
 		ip, err := policy.ParseAddr(bl.IP)
-		if err != nil || !bl.Expires.After(now) {
+		if err != nil {
+			continue
+		}
+		if !bl.Expires.After(now) {
+			// Expired while we were down: keep it only if a backend without
+			// its own expiry still holds it, so the sweeper removes it.
+			if s.hasRemoteRefs(bl) {
+				s.blocks[ip.String()] = bl
+			}
 			continue
 		}
 		if !s.DryRun {
+			// Re-install in backends that forget (nftables after a reboot);
+			// rules held by a CDN are still there.
 			left := max(bl.Expires.Sub(now), time.Second)
-			if err := s.runNft("add", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s timeout %ds }", ip, int(left.Seconds()))); err != nil {
-				log.Printf("restore %s: %v", ip, err)
-				continue
+			for _, b := range s.Backends {
+				if !b.NativeTTL() {
+					continue
+				}
+				if _, err := b.Apply(ip, left, "", bl.Reason); err != nil {
+					log.Printf("restore %s in %s: %v", ip, b.Name(), err)
+				}
 			}
 		}
 		s.blocks[ip.String()] = bl
@@ -461,16 +482,14 @@ func (s *Server) do(role Role, req Request) (Response, string) {
 			log.Printf("audit unavailable, refusing block of %s: %v", key, err)
 			return Response{Error: "audit log unavailable; refusing to change the firewall"}, actor
 		}
+		var refs map[string]string
 		if !s.DryRun {
-			if exists {
-				// "add element" does not refresh the timeout of an existing
-				// element, so replace it to extend the block.
-				_ = s.runNft("delete", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s }", key))
-			}
-			err = s.runNft("add", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s timeout %ds }", key, int(ttl.Seconds())))
+			refs, err = s.applyAll(ip, ttl, old.Refs, req.Reason)
 		}
-		if err == nil {
-			s.blocks[key] = Block{IP: key, Expires: expires, Reason: req.Reason, Actor: owner}
+		// Keep the block if any backend holds it (so it can be removed later),
+		// even when another backend failed; the error is still reported.
+		if err == nil || len(refs) > 0 {
+			s.blocks[key] = Block{IP: key, Expires: expires, Reason: req.Reason, Actor: owner, Refs: refs}
 			s.saveState()
 		}
 	case "unblock":
@@ -481,13 +500,16 @@ func (s *Server) do(role Role, req Request) (Response, string) {
 			log.Printf("audit unavailable, refusing unblock of %s: %v", key, err)
 			return Response{Error: "audit log unavailable; refusing to change the firewall"}, actor
 		}
+		b := s.blocks[key]
 		if !s.DryRun {
-			err = s.runNft("delete", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s }", key))
+			b.Refs, err = s.removeAll(ip, b.Refs, false)
 		}
 		if err == nil {
 			delete(s.blocks, key)
-			s.saveState()
+		} else {
+			s.blocks[key] = b // retry the backends that failed on the next unblock
 		}
+		s.saveState()
 	}
 	result := "ok"
 	if s.DryRun {
@@ -612,15 +634,16 @@ func (s *Server) refreshAllow() {
 			continue
 		}
 		if !s.DryRun {
-			err = s.runNft("delete", "element", "inet", Table, setFor(ip), fmt.Sprintf("{ %s }", key))
+			b.Refs, err = s.removeAll(ip, b.Refs, false)
 		}
 		result := "ok"
 		if err != nil {
 			result = "error: " + err.Error()
+			s.blocks[key] = b
 		} else {
 			delete(s.blocks, key)
-			changed = true
 		}
+		changed = true
 		_ = s.Audit.Write("playbook", "unblock", map[string]any{"ip": key, "reason": "now allowlisted by " + p.String(), "was": b.Reason}, result)
 	}
 	if changed {
@@ -633,14 +656,116 @@ func (s *Server) refreshLoop() {
 	for range time.Tick(10 * time.Second) {
 		s.mu.Lock()
 		s.refreshAllow()
+		s.sweepExpired()
 		s.mu.Unlock()
 	}
 }
 
+// applyAll applies a block in every backend. It returns the refs of the
+// backends that hold it and an error naming those that failed.
+// Caller holds s.mu.
+func (s *Server) applyAll(ip netip.Addr, ttl time.Duration, old map[string]string, note string) (map[string]string, error) {
+	refs := map[string]string{}
+	var errs []error
+	for _, b := range s.Backends {
+		ref, err := b.Apply(ip, ttl, old[b.Name()], note)
+		if err != nil {
+			s.metrics.Inc("nethergate_enforcer_backend_errors_total", "backend", b.Name())
+			errs = append(errs, fmt.Errorf("%s: %w", b.Name(), err))
+			if prev, ok := old[b.Name()]; ok {
+				refs[b.Name()] = prev // still held from before
+			}
+			continue
+		}
+		refs[b.Name()] = ref
+	}
+	if len(refs) == 0 {
+		refs = nil
+	}
+	return refs, errors.Join(errs...)
+}
+
+// removeAll removes a block from the backends that hold it and returns the
+// refs that could not be removed. With remoteOnly, backends that expire
+// blocks by themselves are skipped. Caller holds s.mu.
+func (s *Server) removeAll(ip netip.Addr, refs map[string]string, remoteOnly bool) (map[string]string, error) {
+	left := map[string]string{}
+	var errs []error
+	for _, b := range s.Backends {
+		ref, held := refs[b.Name()]
+		if refs != nil && !held {
+			continue
+		}
+		if remoteOnly && b.NativeTTL() {
+			continue
+		}
+		if err := b.Remove(ip, ref); err != nil {
+			s.metrics.Inc("nethergate_enforcer_backend_errors_total", "backend", b.Name())
+			errs = append(errs, fmt.Errorf("%s: %w", b.Name(), err))
+			left[b.Name()] = ref
+		}
+	}
+	if len(left) == 0 {
+		left = nil
+	}
+	return left, errors.Join(errs...)
+}
+
+// hasRemoteRefs reports whether a backend that cannot expire blocks by
+// itself still holds b.
+func (s *Server) hasRemoteRefs(b Block) bool {
+	for _, be := range s.Backends {
+		if ref, ok := b.Refs[be.Name()]; ok && !be.NativeTTL() && !strings.HasPrefix(ref, "external:") {
+			return true
+		}
+	}
+	return false
+}
+
+// sweepExpired removes expired blocks from backends without native expiry
+// (e.g. Cloudflare rules). Like every firewall change it is audited first;
+// if the audit log is unavailable the block stays a little longer, which
+// is the safe direction. Caller holds s.mu.
+func (s *Server) sweepExpired() {
+	now := time.Now()
+	changed := false
+	for key, b := range s.blocks {
+		if now.Before(b.Expires) || !s.hasRemoteRefs(b) {
+			continue
+		}
+		ip, err := netip.ParseAddr(key)
+		if err != nil {
+			continue
+		}
+		detail := map[string]any{"ip": key, "reason": "expired", "was": b.Reason, "owner": b.Actor}
+		if err := s.Audit.Write("system", "expire_intent", detail, "pending"); err != nil {
+			log.Printf("audit unavailable, keeping expired block on %s: %v", key, err)
+			continue
+		}
+		result := "ok"
+		if s.DryRun {
+			delete(s.blocks, key)
+		} else if left, err := s.removeAll(ip, b.Refs, true); err != nil {
+			result = "error: " + err.Error()
+			b.Refs = left
+			s.blocks[key] = b
+		} else {
+			delete(s.blocks, key)
+		}
+		changed = true
+		_ = s.Audit.Write("system", "expire", detail, result)
+	}
+	if changed {
+		s.saveState()
+	}
+}
+
+// expire forgets expired blocks that no backend still holds (nftables
+// expires them itself). Remote ones are left for sweepExpired.
 func (s *Server) expire() {
 	now := time.Now()
 	for k, b := range s.blocks {
-		if now.After(b.Expires) {
+		if now.After(b.Expires) && !s.hasRemoteRefs(b) {
 			delete(s.blocks, k)
 		}
 	}

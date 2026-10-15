@@ -9,6 +9,8 @@
   "enforcer_socket": "/run/nethergate/enforcer.sock",
   "enforcer_clients": { "watch_uids": [], "mcp_uids": [], "admin_uids": [] },
   "audit_anchor": { "interval": "5m", "url": "" },
+  "trusted_proxies": [],
+  "enforcement": { "backends": ["nftables"] },
   "allowlist": ["127.0.0.0/8", "::1/128", "192.0.2.10/32"],
   "window": "24h",
   "max_scan_bytes": 67108864,

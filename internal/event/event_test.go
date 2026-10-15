@@ -1,6 +1,7 @@
 package event
 
 import (
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -62,5 +63,41 @@ func TestParseSSHDSpoofAndSession(t *testing.T) {
 	}
 	if _, ok := ParseNginx(`fe80::1%eth0 - - [14/Oct/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 1 "-" "-"`); ok {
 		t.Error("zoned address accepted")
+	}
+}
+
+func TestResolveClientBehindProxy(t *testing.T) {
+	cdn := []netip.Prefix{netip.MustParsePrefix("173.245.48.0/20"), netip.MustParsePrefix("2400:cb00::/32")}
+	line := func(peer, xff string) string {
+		return peer + ` - - [14/Oct/2026:10:00:00 +0000] "GET /.env HTTP/1.1" 404 1 "-" "sqlmap" "` + xff + `"`
+	}
+	cases := []struct {
+		peer, xff, want string
+		ok              bool
+	}{
+		{"173.245.48.10", "203.0.113.5", "203.0.113.5", true},                // via CDN
+		{"173.245.48.10", "1.1.1.1, 203.0.113.5", "203.0.113.5", true},       // client-forged left part ignored
+		{"173.245.48.10", "203.0.113.5, 173.245.48.99", "203.0.113.5", true}, // CDN hop skipped
+		{"198.51.100.7", "1.1.1.1", "198.51.100.7", true},                    // direct: header is forged, ignored
+		{"173.245.48.10", "", "", false},                                     // CDN without a client: never score the CDN
+		{"173.245.48.10", "173.245.48.11", "", false},                        // only proxies
+		{"173.245.48.10", "not-an-ip", "", false},                            // garbage
+		{"2400:cb00::1", "[2001:db8::7]:4431", "2001:db8::7", true},          // IPv6 with port
+		{"173.245.48.10", "::ffff:203.0.113.9", "203.0.113.9", true},         // mapped
+	}
+	for _, c := range cases {
+		ev, ok := ParseNginxProxy(line(c.peer, c.xff))
+		if !ok {
+			t.Fatalf("parse %q", c.peer)
+		}
+		got := ev.ResolveClient(cdn)
+		if got != c.ok || (got && ev.IP.String() != c.want) {
+			t.Errorf("peer %s xff %q: ok=%v ip=%v, want %v %s", c.peer, c.xff, got, ev.IP, c.ok, c.want)
+		}
+	}
+	// Plain "nginx" format from a CDN address = real_ip not configured.
+	ev, _ := ParseNginx(line("173.245.48.10", "203.0.113.5"))
+	if ev.ResolveClient(cdn) {
+		t.Error("CDN address accepted as client without real_ip")
 	}
 }

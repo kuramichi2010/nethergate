@@ -35,8 +35,13 @@ func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Durat
 func (d Duration) D() time.Duration { return time.Duration(d) }
 
 type LogSource struct {
-	Path   string `json:"path"`
-	Format string `json:"format"` // "nginx" | "sshd"
+	Path string `json:"path"`
+	// "nginx": combined format; $remote_addr must already be the client
+	// (nginx real_ip module behind a CDN).
+	// "nginx_proxy": combined + a final quoted "$http_x_forwarded_for";
+	// the client is taken from it when the peer is a trusted proxy.
+	// "sshd": OpenSSH auth log.
+	Format string `json:"format"`
 }
 
 type Policy struct {
@@ -155,6 +160,55 @@ type Metrics struct {
 	AllowRemote bool   `json:"allow_remote"`
 }
 
+// Enforcement selects where blocks are applied. "nftables" drops packets
+// at this host (direct connections). Behind a CDN the attacker never
+// connects directly, so the block must happen at the CDN: "cloudflare"
+// adds an IP Access Rule through the Cloudflare API.
+type Enforcement struct {
+	Backends   []string           `json:"backends"` // default ["nftables"]
+	Cloudflare *CloudflareBackend `json:"cloudflare,omitempty"`
+}
+
+type CloudflareBackend struct {
+	ZoneID string `json:"zone_id"`
+	// Environment variable with an API token limited to
+	// "Zone > Firewall Services > Edit" on this zone. Only the enforcer
+	// reads it; the AI and the watch daemon never see it.
+	TokenEnv string `json:"token_env"`
+	// API base, overridable for tests.
+	APIBase string `json:"api_base,omitempty"`
+}
+
+func (e *Enforcement) validate() error {
+	if len(e.Backends) == 0 {
+		e.Backends = []string{"nftables"}
+	}
+	seen := map[string]bool{}
+	for _, b := range e.Backends {
+		if seen[b] {
+			return fmt.Errorf("enforcement.backends: %q listed twice", b)
+		}
+		seen[b] = true
+		switch b {
+		case "nftables":
+		case "cloudflare":
+			cf := e.Cloudflare
+			if cf == nil || cf.ZoneID == "" || cf.TokenEnv == "" {
+				return errors.New("enforcement.cloudflare needs zone_id and token_env")
+			}
+			if cf.APIBase == "" {
+				cf.APIBase = "https://api.cloudflare.com/client/v4"
+			}
+			if u, err := url.Parse(cf.APIBase); err != nil || u.Scheme != "https" {
+				return errors.New("enforcement.cloudflare.api_base must be https")
+			}
+		default:
+			return fmt.Errorf("enforcement.backends: unknown backend %q (nftables, cloudflare)", b)
+		}
+	}
+	return nil
+}
+
 type Notify struct {
 	// Slack/Discord-compatible incoming webhook URL (optional).
 	WebhookURL string `json:"webhook_url"`
@@ -183,7 +237,15 @@ type Config struct {
 	Forward         Forward         `json:"forward"`
 	Metrics         Metrics         `json:"metrics"`
 
+	// CDNs / load balancers in front of this server: their addresses are
+	// never blocked, and X-Forwarded-For is only believed when they send it.
+	// Entries are CIDRs, addresses or presets ("cloudflare").
+	TrustedProxies []string `json:"trusted_proxies"`
+	// Where blocks are applied (see Enforcement).
+	Enforcement Enforcement `json:"enforcement"`
+
 	AllowPrefixes []netip.Prefix `json:"-"`
+	ProxyPrefixes []netip.Prefix `json:"-"`
 }
 
 func Load(path string) (*Config, error) {
@@ -235,6 +297,19 @@ func Default() *Config {
 func (c *Config) Validate() error {
 	var errs []error
 	c.AllowPrefixes = nil
+	if px, err := parseProxies(c.TrustedProxies); err != nil {
+		errs = append(errs, err)
+	} else {
+		c.ProxyPrefixes = px
+	}
+	for _, l := range c.Logs {
+		if l.Format == "nginx_proxy" && len(c.TrustedProxies) == 0 {
+			errs = append(errs, fmt.Errorf("log %s: format nginx_proxy needs trusted_proxies (otherwise X-Forwarded-For could be forged)", l.Path))
+		}
+	}
+	if err := c.Enforcement.validate(); err != nil {
+		errs = append(errs, err)
+	}
 	for _, s := range c.Allowlist {
 		p, err := netip.ParsePrefix(s)
 		if err != nil {
@@ -252,7 +327,7 @@ func (c *Config) Validate() error {
 		c.AllowPrefixes = append(c.AllowPrefixes, p.Masked())
 	}
 	for _, l := range c.Logs {
-		if l.Format != "nginx" && l.Format != "sshd" {
+		if l.Format != "nginx" && l.Format != "nginx_proxy" && l.Format != "sshd" {
 			errs = append(errs, fmt.Errorf("log %s: unknown format %q", l.Path, l.Format))
 		}
 	}

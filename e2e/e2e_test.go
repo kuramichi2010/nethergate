@@ -9,15 +9,18 @@ package e2e
 import (
 	"bufio"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -43,6 +46,8 @@ type env struct {
 	t   *testing.T
 	dir string
 	uid int
+	// Extra environment for every process (e.g. API tokens, CA bundle).
+	extraEnv []string
 }
 
 func (e *env) path(p string) string { return filepath.Join(e.dir, p) }
@@ -82,6 +87,7 @@ func (e *env) cmd(cfg string, args ...string) *exec.Cmd {
 	c.Dir = e.dir
 	c.Env = append(os.Environ(), "PATH="+e.path("fakebin")+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"NFT_LOG="+e.path("nft.log"))
+	c.Env = append(c.Env, e.extraEnv...)
 	return c
 }
 
@@ -461,5 +467,62 @@ func TestEndToEnd(t *testing.T) {
 		waitSIEM("tamper event at the SIEM", func(s string) bool {
 			return strings.Contains(s, " tamper - ") && strings.Contains(s, "enforcer-audit.jsonl")
 		})
+	})
+
+	t.Run("behind a CDN: the real client is blocked at the CDN, the CDN never", func(t *testing.T) {
+		// A fake Cloudflare API; the enforcer trusts its test certificate.
+		var mu sync.Mutex
+		var created []string
+		cf := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body struct{ Configuration struct{ Value string } }
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if r.Method != http.MethodPost || r.Header.Get("Authorization") != "Bearer cf-test-token" {
+				w.WriteHeader(400)
+				return
+			}
+			mu.Lock()
+			created = append(created, body.Configuration.Value)
+			mu.Unlock()
+			fmt.Fprintf(w, `{"success":true,"result":{"id":"rule-%d"}}`, len(created))
+		}))
+		defer cf.Close()
+		pemFile := e.path("cf-ca.pem")
+		_ = os.WriteFile(pemFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cf.Certificate().Raw}), 0o600)
+		e.extraEnv = []string{"SSL_CERT_FILE=" + pemFile, "CF_API_TOKEN=cf-test-token"}
+		defer func() { e.extraEnv = nil }()
+
+		e.writeConfig("as-watch-cdn", fmt.Sprintf(`{"watch_uids": [%d]}`, e.uid),
+			`"logs": [{"path": "cdn.log", "format": "nginx_proxy"}]`,
+			`"trusted_proxies": ["cloudflare"]`,
+			fmt.Sprintf(`"enforcement": {"backends": ["nftables", "cloudflare"], "cloudflare": {"zone_id": "z1", "token_env": "CF_API_TOKEN", "api_base": %q}}`, cf.URL))
+		stopE := e.start("as-watch-cdn", "enforcer")
+		defer stopE()
+		stopW := e.start("as-watch-cdn", "watch")
+		defer stopW()
+
+		ts := time.Now().UTC().Format("02/Jan/2006:15:04:05 -0700")
+		var b strings.Builder
+		for _, p := range []string{"/.env", "/.git/config", "/?id=1%27%20union%20select%201", "/../../etc/passwd"} {
+			// Every request reaches us from a Cloudflare edge address.
+			fmt.Fprintf(&b, "173.245.48.10 - - [%s] \"GET %s HTTP/1.1\" 404 1 \"-\" \"sqlmap\" \"1.2.3.4, 203.0.113.50\"\n", ts, p)
+			// The same probes without a forwarded client must not count against the CDN.
+			fmt.Fprintf(&b, "173.245.48.11 - - [%s] \"GET %s HTTP/1.1\" 404 1 \"-\" \"sqlmap\" \"\"\n", ts, p)
+		}
+		if err := os.WriteFile(e.path("cdn.log"), []byte(b.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		e.waitFor("block at the CDN", 20*time.Second, func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return len(created) > 0
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		if len(created) != 1 || created[0] != "203.0.113.50" {
+			t.Fatalf("cloudflare rules for %v; want only the real client 203.0.113.50 (not the forged 1.2.3.4)", created)
+		}
+		if strings.Contains(e.nftLog(), "173.245.48.") {
+			t.Fatalf("a CDN address was blocked:\n%s", e.nftLog())
+		}
 	})
 }

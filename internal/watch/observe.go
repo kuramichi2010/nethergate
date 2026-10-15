@@ -44,6 +44,7 @@ func newMetrics() *metrics.Registry {
 	m.Describe("nethergate_forward_errors_total", metrics.Counter, "Failed deliveries to the SIEM (retried with backoff).")
 	m.Describe("nethergate_forward_tamper_events_total", metrics.Counter, "Audit files that shrank, were replaced or disappeared.")
 	m.Describe("nethergate_enforcer_up", metrics.Gauge, "1 if the enforcer answered the last metrics scrape.")
+	m.Describe("nethergate_proxy_unresolved_events_total", metrics.Counter, "HTTP events from a trusted proxy (CDN) with no usable client address; dropped. Non-zero means nginx real_ip / log_format is misconfigured.")
 	return m
 }
 
@@ -110,9 +111,17 @@ func (d *Daemon) render(w io.Writer) {
 
 // updateStepGauges records per-step values (called from step).
 func (d *Daemon) updateStepGauges(now time.Time) {
+	if n := d.analyzer.ProxyUnresolved; n > d.proxyWarned {
+		if d.proxyWarned == 0 {
+			log.Printf("warning: %d requests came from a trusted proxy without a usable client address and were ignored; "+
+				"configure nginx real_ip (format nginx) or log X-Forwarded-For (format nginx_proxy)", n)
+		}
+		d.proxyWarned = n
+	}
 	if d.metrics == nil {
 		return
 	}
+	d.metrics.Set("nethergate_proxy_unresolved_events_total", float64(d.analyzer.ProxyUnresolved))
 	bands := map[string]float64{"critical": 0, "high": 0, "medium": 0, "low": 0}
 	for _, inc := range d.analyzer.Incidents(now.Add(-10*time.Minute), 1) {
 		switch {

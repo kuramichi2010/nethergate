@@ -115,6 +115,11 @@ type Guess struct {
 
 type Analyzer struct {
 	Window time.Duration
+	// Trusted proxies (CDN) in front of this server, for client resolution.
+	Proxies []netip.Prefix
+	// HTTP events from a trusted proxy whose client could not be
+	// determined; they are dropped (a sign of a proxy misconfiguration).
+	ProxyUnresolved int
 	// Approved playbook rules, matched on every event.
 	Rules     []*playbook.Rule
 	incidents map[netip.Addr]*Incident

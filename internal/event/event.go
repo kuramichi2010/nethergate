@@ -27,9 +27,77 @@ type Event struct {
 	Status int
 	UA     string
 	User   string
+	// nginx_proxy only: the TCP peer and the X-Forwarded-For header as
+	// logged. IP is the peer until ResolveClient picks the client.
+	Peer         netip.Addr
+	ForwardedFor string
 }
 
 var nginxRe = regexp.MustCompile(`^(\S+) \S+ \S+ \[([^\]]+)\] "([^"]*)" (\d{3}) \S+ "[^"]*" "([^"]*)"`)
+
+var nginxProxyRe = regexp.MustCompile(nginxRe.String() + ` "([^"]*)"`)
+
+// ParseNginxProxy parses combined + a trailing quoted X-Forwarded-For.
+func ParseNginxProxy(line string) (Event, bool) {
+	m := nginxProxyRe.FindStringSubmatch(line)
+	if m == nil {
+		return Event{}, false
+	}
+	ev, ok := ParseNginx(line)
+	if !ok {
+		return Event{}, false
+	}
+	ev.Peer, ev.ForwardedFor = ev.IP, m[6]
+	return ev, true
+}
+
+// ResolveClient decides the client address of an HTTP event given the
+// trusted proxies in front of this server:
+//   - a peer that is not a trusted proxy is the client; any
+//     X-Forwarded-For it sent is ignored (anyone can forge the header);
+//   - behind a trusted proxy, the client is the right-most address in
+//     X-Forwarded-For that is not itself a trusted proxy (entries further
+//     left were written by the client and can be forged).
+//
+// It returns false when the peer is a trusted proxy but no client can be
+// determined (e.g. nginx real_ip not configured): such events must not be
+// scored, or the CDN itself would look like the attacker.
+func (ev *Event) ResolveClient(proxies []netip.Prefix) bool {
+	if ev.Kind != HTTP || len(proxies) == 0 || !inPrefixes(ev.IP, proxies) {
+		return true
+	}
+	parts := strings.Split(ev.ForwardedFor, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		a, ok := parseHop(strings.TrimSpace(parts[i]))
+		if !ok {
+			return false // garbage where a proxy should have written an address
+		}
+		if !inPrefixes(a, proxies) {
+			ev.IP = a
+			return true
+		}
+	}
+	return false
+}
+
+func parseHop(s string) (netip.Addr, bool) {
+	if a, err := netip.ParseAddr(s); err == nil && a.Zone() == "" {
+		return a.Unmap(), true
+	}
+	if ap, err := netip.ParseAddrPort(s); err == nil && ap.Addr().Zone() == "" {
+		return ap.Addr().Unmap(), true
+	}
+	return netip.Addr{}, false
+}
+
+func inPrefixes(a netip.Addr, ps []netip.Prefix) bool {
+	for _, p := range ps {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
 
 // ParseNginx parses the nginx/apache "combined" log format.
 func ParseNginx(line string) (Event, bool) {
@@ -134,6 +202,8 @@ func Parse(format, line string, now time.Time) (Event, bool) {
 	switch format {
 	case "nginx":
 		return ParseNginx(line)
+	case "nginx_proxy":
+		return ParseNginxProxy(line)
 	case "sshd":
 		return ParseSSHD(line, now)
 	}

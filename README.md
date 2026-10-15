@@ -165,6 +165,25 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer 
 - 自動で調査させる場合は、`deploy/triage-command.example.json` の内容を config の `triage.command` に入れます（nethergateのツール以外は使えないようにしてあります）
   - 同じサーバー上で調査させる場合も、MCPサーバーは必ず **ng-mcp** として動かします（`deploy/claude-mcp.local.example.json`：localhost へのSSHでユーザーを切り替える）。watch のユーザーのまま `nethergate mcp` を起動しようとすると、起動を拒否します
 
+## CDN（Cloudflare など）の後ろにあるサーバー
+
+オリジンを CDN の後ろに置くと、サーバーに届く通信の送信元は**攻撃者ではなく CDN の IP**になります。何も対策しないと、ローカルのファイアウォールで止めても効かないか、CDN ごと止めてサイト全体を落とすかのどちらかになります。nethergate は次のように扱います。
+
+1. **CDN を設定する**：`"trusted_proxies": ["cloudflare"]`（CIDR の直接指定も可）
+   - これらのアドレスは**絶対にブロックしない**（enforcer の許可リストに入る）
+   - 送信元が CDN のままで本当の送信元が分からない通信は、**採点もブロックもしない**。件数は `nethergate_proxy_unresolved_events_total` で知らせる（nginx の設定漏れの検出）
+2. **本当の送信元をログに残す**（`deploy/nginx-cdn.example.conf`）
+   - 方法A（推奨）：nginx の `real_ip` で送信元を復元し、形式は `nginx` のまま使う
+   - 方法B：`X-Forwarded-For` もログに出し、形式 `nginx_proxy` を使う。送信元は **X-Forwarded-For の右から順に見て、CDN でない最初のアドレス**とする（左側は攻撃者が自由に書けるので無視する）。CDN 以外から届いたヘッダーは偽装できるので、常に無視する
+3. **CDN 側でブロックする**：`"enforcement": {"backends": ["nftables", "cloudflare"], "cloudflare": {"zone_id": "...", "token_env": "CF_API_TOKEN"}}`
+   - Cloudflare の IP アクセスルールでブロックする。Cloudflare には期限の機能がないので、期限が来たら enforcer が削除する（削除も監査ログに記録し、記録できなければ削除しない。再起動をまたいでも削除し忘れない）
+   - 人間が手で作った同じIPのルールは、自分のものではないので削除しない
+   - API トークンは enforcer だけが読む（AI と watch からは見えない）。権限はその zone の「Firewall Services の編集」だけに絞る。systemd の設定例：`deploy/nethergate-enforcer-cloudflare.conf`
+   - 一部のバックエンドだけ失敗した場合も、成功した分のブロックは保持し、エラーとして記録する
+4. オリジンの 80/443 番ポートは **CDN の IP からだけ受け付ける**ようにする（CDN を経由しない直接接続で、CDN 側のブロックを迂回されないため）
+
+組み込みの Cloudflare の IP 範囲が最新かどうかは `nethergate proxies cloudflare` で確認できます（違っていれば終了コード1）。
+
 ## 証拠を外に出す・状態を見る（SIEM連携とメトリクス）
 
 ### SIEM / syslog への転送

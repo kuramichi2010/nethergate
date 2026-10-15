@@ -46,6 +46,8 @@ type Daemon struct {
 	metrics   *metrics.Registry
 	forwarder *forward.Forwarder
 	aiPaused  bool
+	// ProxyUnresolved count already reported in the log.
+	proxyWarned int
 }
 
 // checkAI follows the enforcer's AI pause flag: humans hear about a

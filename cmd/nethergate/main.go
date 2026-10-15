@@ -55,19 +55,26 @@ const nftRuleset = `table inet nethergate {
 `
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: nethergate [-config path] enforcer|watch|mcp|scan|verify|nft-setup|playbook ...|review ...|correct ...|ai status|pause|resume")
+	fmt.Fprintln(os.Stderr, "usage: nethergate [-config path] enforcer|watch|mcp|scan|verify|nft-setup|playbook ...|review ...|correct ...|ai status|pause|resume|proxies cloudflare")
 	os.Exit(2)
 }
 
 func main() {
 	cfgPath := flag.String("config", "/etc/nethergate/config.json", "config file")
 	flag.Parse()
-	multi := map[string]bool{"playbook": true, "review": true, "correct": true, "verify": true, "ai": true}
+	multi := map[string]bool{"playbook": true, "review": true, "correct": true, "verify": true, "ai": true, "proxies": true}
 	if flag.NArg() < 1 || (flag.NArg() > 1 && !multi[flag.Arg(0)]) {
 		usage()
 	}
 	log.SetFlags(log.LstdFlags | log.LUTC)
 	cmd := flag.Arg(0)
+	if cmd == "proxies" {
+		if err := runProxies(flag.Args()[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if cmd == "nft-setup" {
 		fmt.Print(nftRuleset)
 		return
@@ -93,7 +100,14 @@ func main() {
 	switch cmd {
 	case "enforcer":
 		a := openAudit(cfg.EnforcerStateDir, "enforcer-audit.jsonl")
-		srv := enforce.NewServer(policy.New(cfg.Policy, cfg.AllowPrefixes), a, cfg.EnforcerClients, cfg.Policy, cfg.Policy.DryRun)
+		// A CDN in front of us is never blocked: that would take the whole site down.
+		allow := append(append([]netip.Prefix(nil), cfg.AllowPrefixes...), cfg.ProxyPrefixes...)
+		srv := enforce.NewServer(policy.New(cfg.Policy, allow), a, cfg.EnforcerClients, cfg.Policy, cfg.Policy.DryRun)
+		backends, err := buildBackends(cfg, srv)
+		if err != nil {
+			log.Fatal(err)
+		}
+		srv.Backends = backends
 		// Automated blocks are re-authorised from the logs, not from the caller.
 		srv.Verify = func(ip netip.Addr) (*detect.Incident, []*playbook.Rule, error) {
 			rules, errs := playbook.Load(cfg.Playbook.Path)
@@ -257,4 +271,25 @@ func mustRunAs(cfg *config.Config, role string, uids []int) {
 		log.Fatalf("refusing to run %s as uid %d: that uid has another role at the enforcer; run it as one of enforcer_clients.%s_uids %v", role, uid, role, uids)
 	}
 	log.Printf("warning: uid %d is not in enforcer_clients.%s_uids; the enforcer will refuse its requests", uid, role)
+}
+
+// buildBackends creates the configured enforcement backends. API tokens are
+// read here, in the enforcer only; the AI and the watch daemon never see them.
+func buildBackends(cfg *config.Config, srv *enforce.Server) ([]enforce.Backend, error) {
+	var out []enforce.Backend
+	for _, name := range cfg.Enforcement.Backends {
+		switch name {
+		case "nftables":
+			out = append(out, srv.NFTBackend())
+		case "cloudflare":
+			cf := cfg.Enforcement.Cloudflare
+			tok := os.Getenv(cf.TokenEnv)
+			if tok == "" {
+				return nil, fmt.Errorf("enforcement.cloudflare: environment variable %s is empty (put it in /etc/nethergate/enforcer.env)", cf.TokenEnv)
+			}
+			out = append(out, &enforce.CloudflareBackend{ZoneID: cf.ZoneID, Token: tok, Base: cf.APIBase})
+		}
+	}
+	log.Printf("enforcement backends: %v", cfg.Enforcement.Backends)
+	return out, nil
 }

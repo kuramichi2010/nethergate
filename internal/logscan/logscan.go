@@ -36,6 +36,7 @@ func ScanIP(cfg *config.Config, rules []*playbook.Rule, ip netip.Addr, now time.
 func scan(cfg *config.Config, rules []*playbook.Rule, now time.Time, only netip.Addr) (*detect.Analyzer, error) {
 	a := detect.NewAnalyzer(cfg.Window.D())
 	a.Rules = rules
+	a.Proxies = cfg.ProxyPrefixes
 	since := now.Add(-cfg.Window.D())
 	var firstErr error
 	opened := 0
@@ -84,8 +85,14 @@ func feedOnly(a *detect.Analyzer, format string, r io.Reader, since, now time.Ti
 		if len(line) > 0 && line[len(line)-1] == '\n' {
 			n += int64(len(line))
 			if len(line) <= 16<<10 && (needle == "" || strings.Contains(line, needle)) { // ignore absurd lines rather than buffer them
-				if ev, ok := event.Parse(format, line[:len(line)-1], now); ok && !ev.Time.Before(since) && (needle == "" || ev.IP == only) {
-					a.Add(ev)
+				if ev, ok := event.Parse(format, line[:len(line)-1], now); ok && !ev.Time.Before(since) {
+					// Behind a CDN the peer is the CDN: find the real client,
+					// and never score the CDN itself.
+					if !ev.ResolveClient(a.Proxies) {
+						a.ProxyUnresolved++
+					} else if needle == "" || ev.IP == only {
+						a.Add(ev)
+					}
 				}
 			}
 		}
