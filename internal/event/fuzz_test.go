@@ -70,3 +70,36 @@ func FuzzResolveClient(f *testing.F) {
 		}
 	})
 }
+
+// The hand-written parser must agree with the reference regexps exactly.
+func FuzzSplitCombinedMatchesRegexp(f *testing.F) {
+	f.Add(`203.0.113.5 - - [14/Oct/2026:10:00:00 +0900] "GET /.env HTTP/1.1" 404 153 "-" "sqlmap/1.8" "1.2.3.4"`)
+	f.Add(`a b c [x] "" 200 - "" ""`)
+	f.Add("a\tb - - [x] \"\" 200 - \"\" \"\"")
+	f.Add(`a - - [] "" 200 - "" ""`)
+	f.Add(`a - - [x]y] "q" 2000 - "" ""`)
+	f.Fuzz(func(t *testing.T, line string) {
+		fields, rest, ok := splitCombined(line)
+		m := nginxRe.FindStringSubmatch(line)
+		if ok != (m != nil) {
+			t.Fatalf("%q: hand=%v regexp=%v", line, ok, m != nil)
+		}
+		if ok {
+			want := [5]string{m[1], m[2], m[3], m[4], m[5]}
+			if fields != want || rest != line[len(m[0]):] {
+				t.Fatalf("%q: hand=%q/%q regexp=%q", line, fields, rest, want)
+			}
+		}
+		pm := nginxProxyRe.FindStringSubmatch(line)
+		ev, pok := ParseNginxProxy(line)
+		if pm == nil && pok {
+			t.Fatalf("%q: proxy hand accepted, regexp rejected", line)
+		}
+		if pm != nil {
+			_, eok := combinedEvent([5]string{pm[1], pm[2], pm[3], pm[4], pm[5]})
+			if eok != pok || (pok && ev.ForwardedFor != pm[6]) {
+				t.Fatalf("%q: proxy hand=%v %q regexp xff=%q", line, pok, ev.ForwardedFor, pm[6])
+			}
+		}
+	})
+}

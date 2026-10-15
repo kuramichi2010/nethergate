@@ -23,8 +23,14 @@ var bearer = regexp.MustCompile(`(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+`)
 // secret-redacted and at most MaxLen runes (plus an ellipsis marker).
 func Untrusted(s string) string {
 	s = strings.ToValidUTF8(s, "�")
-	s = secretParam.ReplaceAllString(s, "${1}[REDACTED]")
-	s = bearer.ReplaceAllString(s, "${1}[REDACTED]")
+	// The regexes can only match with '=' (parameters) or "bearer"
+	// present; skip them otherwise, which is almost always.
+	if strings.IndexByte(s, '=') >= 0 {
+		s = secretParam.ReplaceAllString(s, "${1}[REDACTED]")
+	}
+	if strings.Contains(strings.ToLower(s), "bearer") {
+		s = bearer.ReplaceAllString(s, "${1}[REDACTED]")
+	}
 	var b strings.Builder
 	n := 0
 	for _, r := range s {

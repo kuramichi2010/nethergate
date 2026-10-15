@@ -5,11 +5,11 @@ package logscan
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log"
 	"net/netip"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/kuramichi2010/nethergate/internal/config"
@@ -74,23 +74,38 @@ func Feed(a *detect.Analyzer, format string, r io.Reader, since, now time.Time) 
 // feedOnly parses lines into a; if only is valid, other sources are skipped
 // (a cheap substring test first, then the parsed address decides).
 func feedOnly(a *detect.Analyzer, format string, r io.Reader, since, now time.Time, only netip.Addr) int64 {
-	needle := ""
+	var needle []byte
 	if only.IsValid() {
-		needle = only.String()
+		needle = []byte(only.String())
 	}
 	br := bufio.NewReaderSize(r, 64<<10)
 	var n int64
 	for {
-		line, err := br.ReadString('\n')
+		// ReadSlice returns a view into the buffer: lines are only copied
+		// into a string when they are actually parsed.
+		line, err := br.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			// A line longer than the buffer (64 KiB) is never parsed: skip it.
+			skipped := int64(len(line))
+			for err == bufio.ErrBufferFull {
+				line, err = br.ReadSlice('\n')
+				skipped += int64(len(line))
+			}
+			if err != nil {
+				return n // unterminated: re-read on the next poll
+			}
+			n += skipped
+			continue
+		}
 		if len(line) > 0 && line[len(line)-1] == '\n' {
 			n += int64(len(line))
-			if len(line) <= 16<<10 && (needle == "" || strings.Contains(line, needle)) { // ignore absurd lines rather than buffer them
-				if ev, ok := event.Parse(format, line[:len(line)-1], now); ok && !ev.Time.Before(since) {
+			if len(line) <= 16<<10 && (needle == nil || bytes.Contains(line, needle)) { // ignore absurd lines rather than buffer them
+				if ev, ok := event.Parse(format, string(line[:len(line)-1]), now); ok && !ev.Time.Before(since) {
 					// Behind a CDN the peer is the CDN: find the real client,
 					// and never score the CDN itself.
 					if !ev.ResolveClient(a.Proxies) {
 						a.ProxyUnresolved++
-					} else if needle == "" || ev.IP == only {
+					} else if needle == nil || ev.IP == only {
 						a.Add(ev)
 					}
 				}

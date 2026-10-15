@@ -10,9 +10,11 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unique"
 
 	"github.com/kuramichi2010/nethergate/internal/event"
 	"github.com/kuramichi2010/nethergate/internal/playbook"
@@ -22,28 +24,121 @@ import (
 type Signature struct {
 	Category string
 	Weight   int
-	Re       *regexp.Regexp
+	Re       *regexp.Regexp // lower-case pattern, for ASCII-only input after asciiLower
+	ReCI     *regexp.Regexp // the same pattern with (?i), for any other input
 }
 
+// sig builds both forms of a lower-case pattern.
+func sig(cat string, w int, pattern string) Signature {
+	return Signature{cat, w, regexp.MustCompile(pattern), regexp.MustCompile("(?i)" + pattern)}
+}
+
+// Signatures are written in lower case. ASCII-only input (nearly every
+// request) is lower-cased and matched case-sensitively, which is several
+// times faster than (?i) in Go's regexp and gives the identical result;
+// input with any non-ASCII byte uses the (?i) form, because Unicode case
+// folding (e.g. the Kelvin sign) interacts with \b and \w.
+// FuzzFoldedSignaturesMatchCaseInsensitive checks the equivalence.
 var pathSignatures = []Signature{
-	{"sqli", 25, regexp.MustCompile(`(?i)(union(\s|\+|/\*\*/)+select|'\s*or\s*'?\d|\bor\s+1=1|sleep\(\d|benchmark\(|information_schema|extractvalue\(|waitfor\s+delay)`)},
-	{"path_traversal", 25, regexp.MustCompile(`(?i)(\.\./|\.\.\\|/etc/passwd|/proc/self/|win\.ini|boot\.ini)`)},
-	{"rce", 35, regexp.MustCompile(`(?i)(\$\{jndi:|;\s*(wget|curl|bash|sh)\s|\|\s*(wget|curl)|/bin/(ba)?sh|cmd\.exe|powershell|\$\(|base64_decode\(|eval\(|system\(|shell_exec)`)},
-	{"xss", 15, regexp.MustCompile(`(?i)(<script|javascript:|onerror\s*=|onload\s*=|<svg[^>]*on\w+=)`)},
-	{"sensitive_file_probe", 15, regexp.MustCompile(`(?i)(/\.env|/\.git/|/\.aws/|/\.ssh/|/wp-config\.php|/config\.php\.bak|\.sql(\.gz)?$|/backup\.(zip|tar)|/\.DS_Store|/id_rsa|/server-status)`)},
-	{"admin_probe", 8, regexp.MustCompile(`(?i)(/wp-login\.php|/wp-admin|/phpmyadmin|/pma/|/adminer|/xmlrpc\.php|/manager/html|/actuator|/solr/admin|/console/)`)},
-	{"known_exploit_path", 30, regexp.MustCompile(`(?i)(/cgi-bin/.*\.(sh|cgi)|/vendor/phpunit/.*eval-stdin|/boaform/|/HNAP1|/GponForm|/\.well-known/.*\.php|/autodiscover/autodiscover\.json|/ecp/|/owa/auth/x\.js|/remote/fgt_lang|/dana-na/)`)},
+	sig("sqli", 25, `(union(\s|\+|/\*\*/)+select|'\s*or\s*'?\d|\bor\s+1=1|sleep\(\d|benchmark\(|information_schema|extractvalue\(|waitfor\s+delay)`),
+	sig("path_traversal", 25, `(\.\./|\.\.\\|/etc/passwd|/proc/self/|win\.ini|boot\.ini)`),
+	sig("rce", 35, `(\$\{jndi:|;\s*(wget|curl|bash|sh)\s|\|\s*(wget|curl)|/bin/(ba)?sh|cmd\.exe|powershell|\$\(|base64_decode\(|eval\(|system\(|shell_exec)`),
+	sig("xss", 15, `(<script|javascript:|onerror\s*=|onload\s*=|<svg[^>]*on\w+=)`),
+	sig("sensitive_file_probe", 15, `(/\.env|/\.git/|/\.aws/|/\.ssh/|/wp-config\.php|/config\.php\.bak|\.sql(\.gz)?$|/backup\.(zip|tar)|/\.ds_store|/id_rsa|/server-status)`),
+	sig("admin_probe", 8, `(/wp-login\.php|/wp-admin|/phpmyadmin|/pma/|/adminer|/xmlrpc\.php|/manager/html|/actuator|/solr/admin|/console/)`),
+	sig("known_exploit_path", 30, `(/cgi-bin/.*\.(sh|cgi)|/vendor/phpunit/.*eval-stdin|/boaform/|/hnap1|/gponform|/\.well-known/.*\.php|/autodiscover/autodiscover\.json|/ecp/|/owa/auth/x\.js|/remote/fgt_lang|/dana-na/)`),
 }
 
-var scannerUA = regexp.MustCompile(`(?i)(sqlmap|nikto|nuclei|masscan|zgrab|gobuster|ffuf|dirbuster|wpscan|nmap|acunetix|netsparker|burp|hydra|feroxbuster|httpx|interactsh)`)
-var botUA = regexp.MustCompile(`(?i)(python-requests|python-httpx|aiohttp|go-http-client|libwww-perl|curl/|wget/|okhttp|java/|node-fetch|axios|headless)`)
+var scannerUA, scannerUACI = regexp.MustCompile(scannerPat), regexp.MustCompile("(?i)" + scannerPat)
+var botUA, botUACI = regexp.MustCompile(botPat), regexp.MustCompile("(?i)" + botPat)
+
+const scannerPat = `(sqlmap|nikto|nuclei|masscan|zgrab|gobuster|ffuf|dirbuster|wpscan|nmap|acunetix|netsparker|burp|hydra|feroxbuster|httpx|interactsh)`
+const botPat = `(python-requests|python-httpx|aiohttp|go-http-client|libwww-perl|curl/|wget/|okhttp|java/|node-fetch|axios|headless)`
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLower(s string) string {
+	for i := 0; i < len(s); i++ {
+		if 'A' <= s[i] && s[i] <= 'Z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'A' <= b[j] && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
+const classifyCacheMax = 1 << 16
+
+// pathCategories returns a bitmask of matching pathSignatures. Real logs
+// repeat the same paths constantly, so results are cached (bounded).
+func (a *Analyzer) pathCategories(decoded string) uint16 {
+	if m, ok := a.pathCache[decoded]; ok {
+		return m
+	}
+	var m uint16
+	if isASCII(decoded) {
+		f := asciiLower(decoded)
+		for i, s := range pathSignatures {
+			if s.Re.MatchString(f) {
+				m |= 1 << i
+			}
+		}
+	} else {
+		for i, s := range pathSignatures {
+			if s.ReCI.MatchString(decoded) {
+				m |= 1 << i
+			}
+		}
+	}
+	if a.pathCache == nil || len(a.pathCache) >= classifyCacheMax {
+		a.pathCache = map[string]uint16{}
+	}
+	a.pathCache[decoded] = m
+	return m
+}
+
+// uaKind: 1 known attack tool, 2 scripted client, 0 neither (cached).
+func (a *Analyzer) uaKind(ua string) uint8 {
+	if k, ok := a.uaCache[ua]; ok {
+		return k
+	}
+	scanner, bot := scannerUACI, botUACI
+	f := ua
+	if isASCII(ua) {
+		scanner, bot, f = scannerUA, botUA, asciiLower(ua)
+	}
+	var k uint8
+	switch {
+	case scanner.MatchString(f):
+		k = 1
+	case bot.MatchString(f):
+		k = 2
+	}
+	if a.uaCache == nil || len(a.uaCache) >= classifyCacheMax {
+		a.uaCache = map[string]uint8{}
+	}
+	a.uaCache[ua] = k
+	return k
+}
 
 type Incident struct {
 	IP         netip.Addr     `json:"ip"`
 	FirstSeen  time.Time      `json:"first_seen"`
 	LastSeen   time.Time      `json:"last_seen"`
 	Score      int            `json:"score"`
-	Categories map[string]int `json:"categories"`
+	Categories map[string]int `json:"categories,omitempty"`
 	Requests   int            `json:"http_requests"`
 	Errors4xx  int            `json:"http_4xx"`
 	Errors5xx  int            `json:"http_5xx"`
@@ -63,11 +158,60 @@ type Incident struct {
 	ruleHits  map[*playbook.Rule]int
 	allowHits map[*playbook.Rule]int
 
-	paths   map[string]struct{}
-	uas     map[string]struct{}
-	users   map[string]struct{}
-	times   []time.Time
-	targets map[string]int // first path segment -> hits, i.e. entry points
+	// Distinct raw values (at most maxDistinct each). Small slices rather
+	// than maps: most sources have one or two, and there can be hundreds
+	// of thousands of sources. Samples are sanitised only when reported.
+	paths   []string
+	uas     []string
+	users   []string
+	times   []int64  // unix seconds, at most 4096
+	targets []target // entry points (raw) and hit counts
+	dirty   bool     // changed since last scored
+	sampled bool     // Sample* fields are current
+}
+
+type target struct {
+	key string
+	n   int
+}
+
+const maxDistinct = 256
+
+func addDistinct(list *[]string, s string) bool {
+	if s == "" || len(*list) >= maxDistinct {
+		return false
+	}
+	for _, v := range *list {
+		if v == s {
+			return false
+		}
+	}
+	*list = append(*list, intern(s))
+	return true
+}
+
+// intern returns a canonical copy of s. Values from a log line are
+// substrings of that line: storing them directly would keep every whole
+// line alive, and the same user agents and paths repeat across sources.
+func intern(s string) string { return unique.Make(s).Value() }
+
+func samples(list []string) []string {
+	var out []string
+	for i := 0; i < len(list) && i < maxSamples; i++ {
+		out = append(out, sanitize.Untrusted(list[i]))
+	}
+	return out
+}
+
+// finalize fills the sanitised samples of an incident that is about to be
+// reported (done lazily: sanitising every source on every event was the
+// single largest cost of a scan).
+func (inc *Incident) finalize() {
+	if inc.sampled {
+		return
+	}
+	inc.SamplePaths, inc.SampleUAs, inc.SampleUsers = samples(inc.paths), samples(inc.uas), samples(inc.users)
+	inc.sampled = true
 }
 
 type PlaybookMatch struct {
@@ -120,6 +264,9 @@ type Analyzer struct {
 	// HTTP events from a trusted proxy whose client could not be
 	// determined; they are dropped (a sign of a proxy misconfiguration).
 	ProxyUnresolved int
+
+	pathCache map[string]uint16
+	uaCache   map[string]uint8
 	// Approved playbook rules, matched on every event.
 	Rules     []*playbook.Rule
 	incidents map[netip.Addr]*Incident
@@ -131,26 +278,15 @@ func NewAnalyzer(window time.Duration) *Analyzer {
 
 const maxSamples = 8
 
-func addSample(set map[string]struct{}, list *[]string, s string) {
-	if s == "" || len(set) >= 256 {
-		return
-	}
-	if _, ok := set[s]; ok {
-		return
-	}
-	set[s] = struct{}{}
-	if len(*list) < maxSamples {
-		*list = append(*list, sanitize.Untrusted(s))
-	}
-}
-
 func (a *Analyzer) Add(ev event.Event) {
 	inc := a.incidents[ev.IP]
 	if inc == nil {
-		inc = &Incident{IP: ev.IP, FirstSeen: ev.Time, Categories: map[string]int{},
-			paths: map[string]struct{}{}, uas: map[string]struct{}{}, users: map[string]struct{}{}, targets: map[string]int{}}
+		// Maps are created on first use: most sources only ever send a few
+		// harmless requests, and there can be hundreds of thousands of them.
+		inc = &Incident{IP: ev.IP, FirstSeen: ev.Time}
 		a.incidents[ev.IP] = inc
 	}
+	inc.dirty, inc.sampled = true, false
 	if ev.Time.Before(inc.FirstSeen) {
 		inc.FirstSeen = ev.Time
 	}
@@ -178,7 +314,7 @@ func (a *Analyzer) Add(ev event.Event) {
 		}
 	}
 	if len(inc.times) < 4096 {
-		inc.times = append(inc.times, ev.Time)
+		inc.times = append(inc.times, ev.Time.Unix())
 	}
 	switch ev.Kind {
 	case event.HTTP:
@@ -190,31 +326,34 @@ func (a *Analyzer) Add(ev event.Event) {
 			inc.Errors4xx++
 		}
 		matched := a.matchRules(inc, ev, decoded)
-		for _, s := range pathSignatures {
-			if s.Re.MatchString(decoded) {
-				inc.Categories[s.Category]++
-				matched = true
+		if cats := a.pathCategories(decoded); cats != 0 {
+			for i, s := range pathSignatures {
+				if cats&(1<<i) != 0 {
+					inc.cat(s.Category)
+					matched = true
+				}
 			}
 		}
-		if scannerUA.MatchString(ev.UA) {
-			inc.Categories["scanner_tool_ua"]++
-		} else if botUA.MatchString(ev.UA) {
-			inc.Categories["scripted_client_ua"]++
+		switch a.uaKind(ev.UA) {
+		case 1:
+			inc.cat("scanner_tool_ua")
+		case 2:
+			inc.cat("scripted_client_ua")
 		}
 		if ev.UA == "" || ev.UA == "-" {
-			inc.Categories["empty_ua"]++
+			inc.cat("empty_ua")
 		}
 		if matched || ev.Status >= 400 {
-			addSample(inc.paths, &inc.SamplePaths, ev.Path)
+			addDistinct(&inc.paths, ev.Path)
 		}
-		addSample(inc.uas, &inc.SampleUAs, ev.UA)
+		addDistinct(&inc.uas, ev.UA)
 		addTarget(inc, entryPoint(ev.Path))
 	case event.SSHFail, event.SSHInvalidUser:
 		inc.SSHFails++
 		if ev.Kind == event.SSHInvalidUser {
-			inc.Categories["ssh_invalid_user"]++
+			inc.cat("ssh_invalid_user")
 		}
-		addSample(inc.users, &inc.SampleUsers, ev.User)
+		addDistinct(&inc.users, ev.User)
 		addTarget(inc, "ssh")
 		a.matchRules(inc, ev, "")
 	case event.SSHAccepted:
@@ -242,18 +381,32 @@ func (a *Analyzer) matchRules(inc *Incident, ev event.Event, decoded string) boo
 // addTarget counts hits per entry point, keeping at most 256 distinct ones
 // so a single source cannot grow memory with endless unique paths.
 func addTarget(inc *Incident, ep string) {
-	if _, ok := inc.targets[ep]; ok || len(inc.targets) < 256 {
-		inc.targets[ep]++
+	for i := range inc.targets {
+		if inc.targets[i].key == ep {
+			inc.targets[i].n++
+			return
+		}
 	}
+	if len(inc.targets) < maxDistinct {
+		inc.targets = append(inc.targets, target{intern(ep), 1})
+	}
+}
+
+func (inc *Incident) cat(name string) {
+	if inc.Categories == nil {
+		inc.Categories = map[string]int{}
+	}
+	inc.Categories[name]++
 }
 
 func entryPoint(p string) string {
 	p = strings.SplitN(p, "?", 2)[0]
 	segs := strings.SplitN(strings.TrimPrefix(p, "/"), "/", 3)
+	// Raw here (this runs for every request); sanitized when reported.
 	if len(segs) >= 2 && segs[1] != "" {
-		return sanitize.Untrusted("/" + segs[0] + "/" + segs[1])
+		return "/" + segs[0] + "/" + segs[1]
 	}
-	return sanitize.Untrusted("/" + segs[0])
+	return "/" + segs[0]
 }
 
 // Incidents scores everything and returns incidents seen after since,
@@ -266,6 +419,7 @@ func (a *Analyzer) Incidents(since time.Time, minScore int) []*Incident {
 		}
 		score(inc)
 		if inc.Score >= minScore {
+			inc.finalize()
 			out = append(out, inc)
 		}
 	}
@@ -282,6 +436,7 @@ func (a *Analyzer) Get(ip netip.Addr) *Incident {
 	inc := a.incidents[ip]
 	if inc != nil {
 		score(inc)
+		inc.finalize()
 	}
 	return inc
 }
@@ -321,6 +476,10 @@ func weightOf(cat string) int {
 }
 
 func score(inc *Incident) {
+	if !inc.dirty {
+		return // nothing new since the last scoring
+	}
+	inc.dirty = false
 	s := 0
 	for cat, n := range inc.Categories {
 		w := weightOf(cat)
@@ -366,15 +525,15 @@ func score(inc *Incident) {
 	inc.Actor = guess(inc)
 }
 
-func peakPerMinute(ts []time.Time) int {
+func peakPerMinute(ts []int64) int {
 	if len(ts) < 2 {
 		return len(ts)
 	}
-	sorted := append([]time.Time(nil), ts...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Before(sorted[j]) })
+	sorted := slices.Clone(ts)
+	slices.Sort(sorted)
 	best, j := 0, 0
 	for i := range sorted {
-		for sorted[i].Sub(sorted[j]) > time.Minute {
+		for sorted[i]-sorted[j] > 60 {
 			j++
 		}
 		best = max(best, i-j+1)
@@ -430,12 +589,17 @@ func guess(inc *Incident) Guess {
 		v int
 	}
 	var eps []kv
-	for k, v := range inc.targets {
-		eps = append(eps, kv{k, v})
+	for _, t := range inc.targets {
+		eps = append(eps, kv{t.key, t.n})
 	}
-	sort.Slice(eps, func(i, j int) bool { return eps[i].v > eps[j].v })
+	sort.Slice(eps, func(i, j int) bool {
+		if eps[i].v != eps[j].v {
+			return eps[i].v > eps[j].v
+		}
+		return eps[i].k < eps[j].k // deterministic order for ties
+	})
 	for i := 0; i < len(eps) && i < 5; i++ {
-		g.EntryPoint = append(g.EntryPoint, eps[i].k)
+		g.EntryPoint = append(g.EntryPoint, sanitize.Untrusted(eps[i].k))
 	}
 	return g
 }

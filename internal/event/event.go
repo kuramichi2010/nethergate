@@ -39,16 +39,92 @@ var nginxProxyRe = regexp.MustCompile(nginxRe.String() + ` "([^"]*)"`)
 
 // ParseNginxProxy parses combined + a trailing quoted X-Forwarded-For.
 func ParseNginxProxy(line string) (Event, bool) {
-	m := nginxProxyRe.FindStringSubmatch(line)
-	if m == nil {
+	f, rest, ok := splitCombined(line)
+	if !ok || !strings.HasPrefix(rest, ` "`) {
 		return Event{}, false
 	}
-	ev, ok := ParseNginx(line)
+	end := strings.IndexByte(rest[2:], '"')
+	if end < 0 {
+		return Event{}, false
+	}
+	ev, ok := combinedEvent(f)
 	if !ok {
 		return Event{}, false
 	}
-	ev.Peer, ev.ForwardedFor = ev.IP, m[6]
+	ev.Peer, ev.ForwardedFor = ev.IP, rest[2:2+end]
 	return ev, true
+}
+
+// isSpace is Go regexp's \s: [\t\n\f\r ].
+func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r' }
+
+// token reads \S+ followed by one space (the delimiter).
+func token(s string) (tok, rest string, ok bool) {
+	i := 0
+	for i < len(s) && !isSpace(s[i]) {
+		i++
+	}
+	if i == 0 || i >= len(s) || s[i] != ' ' {
+		return "", "", false
+	}
+	return s[:i], s[i+1:], true
+}
+
+// quoted reads "[^"]*" and returns the inside.
+func quoted(s string) (in, rest string, ok bool) {
+	if len(s) == 0 || s[0] != '"' {
+		return "", "", false
+	}
+	end := strings.IndexByte(s[1:], '"')
+	if end < 0 {
+		return "", "", false
+	}
+	return s[1 : 1+end], s[2+end:], true
+}
+
+// splitCombined is a hand-written equivalent of nginxRe (it runs on every
+// line; the regexp was half the cost of a scan). FuzzSplitCombinedMatchesRegexp
+// checks that both always agree. f = ip, time, request, status, ua.
+func splitCombined(line string) (f [5]string, rest string, ok bool) {
+	if f[0], rest, ok = token(line); !ok {
+		return
+	}
+	for i := 0; i < 2; i++ {
+		if _, rest, ok = token(rest); !ok {
+			return
+		}
+	}
+	if len(rest) < 2 || rest[0] != '[' {
+		return f, "", false
+	}
+	end := strings.IndexByte(rest, ']')
+	if end < 2 || !strings.HasPrefix(rest[end:], "] ") {
+		return f, "", false
+	}
+	f[1], rest = rest[1:end], rest[end+2:]
+	if f[2], rest, ok = quoted(rest); !ok || !strings.HasPrefix(rest, " ") {
+		return f, "", false
+	}
+	rest = rest[1:]
+	if len(rest) < 4 || rest[3] != ' ' {
+		return f, "", false
+	}
+	for i := 0; i < 3; i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return f, "", false
+		}
+	}
+	f[3], rest = rest[:3], rest[4:]
+	if _, rest, ok = token(rest); !ok {
+		return
+	}
+	if _, rest, ok = quoted(rest); !ok || !strings.HasPrefix(rest, " ") {
+		return f, "", false
+	}
+	if f[4], rest, ok = quoted(rest[1:]); !ok {
+		return
+	}
+	return f, rest, true
 }
 
 // ResolveClient decides the client address of an HTTP event given the
@@ -101,26 +177,30 @@ func inPrefixes(a netip.Addr, ps []netip.Prefix) bool {
 
 // ParseNginx parses the nginx/apache "combined" log format.
 func ParseNginx(line string) (Event, bool) {
-	m := nginxRe.FindStringSubmatch(line)
-	if m == nil {
+	f, _, ok := splitCombined(line)
+	if !ok {
 		return Event{}, false
 	}
-	ip, err := parseIP(m[1])
+	return combinedEvent(f)
+}
+
+func combinedEvent(f [5]string) (Event, bool) {
+	ip, err := parseIP(f[0])
 	if err != nil {
 		return Event{}, false
 	}
-	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", m[2])
+	t, err := time.Parse("02/Jan/2006:15:04:05 -0700", f[1])
 	if err != nil {
 		return Event{}, false
 	}
-	status, _ := strconv.Atoi(m[4])
-	ev := Event{Time: t, Kind: HTTP, IP: ip, Status: status, UA: m[5]}
+	status, _ := strconv.Atoi(f[3])
+	ev := Event{Time: t, Kind: HTTP, IP: ip, Status: status, UA: f[4]}
 	// Request line: "METHOD PATH PROTO", but scanners send garbage too.
-	parts := strings.SplitN(m[3], " ", 3)
-	if len(parts) >= 2 {
-		ev.Method, ev.Path = parts[0], parts[1]
+	if m, after, ok := strings.Cut(f[2], " "); ok {
+		ev.Method = m
+		ev.Path, _, _ = strings.Cut(after, " ")
 	} else {
-		ev.Path = m[3]
+		ev.Path = f[2]
 	}
 	return ev, true
 }

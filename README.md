@@ -136,7 +136,7 @@ sudo nethergate playbook remove <id>   # 承認済みルールを無効にする
 ## セットアップ（Debian/Ubuntu系の例）
 
 ```bash
-go build -trimpath -ldflags=-s -o nethergate ./cmd/nethergate
+go build -trimpath -ldflags="-s -w" -o nethergate ./cmd/nethergate   # 約8MB（デバッグ情報なし）
 sudo install -m 0755 nethergate /usr/local/bin/
 sudo install -D -m 0644 deploy/sysusers-nethergate.conf /etc/sysusers.d/nethergate.conf && sudo systemd-sysusers
 #   AIはSSHで ng-mcp としてつなぐ：ホームと authorized_keys を用意する（鍵ファイルは root 所有）
@@ -239,6 +239,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now nethergate-enforcer 
 go test -race -short ./...                       # 単体テスト
 go test ./e2e                                    # 結合テスト：実際のバイナリを偽の nft で動かす
 ./scripts/fuzz.sh 30s                            # 全ファジング対象を各30秒
+NG_BENCH_LOG=/var/log/nginx/access.log go test ./internal/logscan -run '^$' -bench .   # 実際のログで解析速度とメモリを測る
 go run ./cmd/nethergate -config cfg.json scan    # 現在のインシデントをJSONで表示
 go run ./cmd/nethergate -config cfg.json verify  # 監査ログの改ざんチェック
 ```
